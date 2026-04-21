@@ -132,7 +132,3 @@ Sắp xếp từ **foundational → advanced → unknown territory**:
 > **Q14.** Khi guild có 1 triệu+ concurrent users, `@everyone` ping trở thành bài toán riêng biệt. Worker process + ETS giải quyết permission check cho 1 triệu users trong bao lâu, và bottleneck tiếp theo sau ETS là gì?
 
 > **Q15.** Với 32 triệu active guilds, Discord không thể giữ tất cả guild processes trong memory — cơ chế lazy load/unload guild process hoạt động như thế nào, và làm sao tránh thundering herd khi một guild "cold start" đột ngột nhận flood traffic?
-
----
-
-Gõ **"continue"** để bắt đầu Q1: **Tại sao "1 guild = 1 process" và khi nào nó vỡ**.
