@@ -2750,3 +2750,551 @@ Discord design principle:
 ```
 
 ---
+
+# Q6: FastGlobal — Exploit BEAM Shared Heap, Nhanh Hơn ETS 23 Lần
+
+*Đây là một trong những trick thông minh nhất trong toàn bộ Erlang ecosystem*
+
+---
+
+## Vấn đề FastGlobal giải quyết
+
+Nhắc lại từ Q1: Khi session server crash và restart, chỉ riêng chi phí lookup trên hash ring đã tốn khoảng 30 giây. Discord dùng ETS (7μs/lookup) rồi sau đó dùng FastGlobal (0.3μs/lookup) — nhanh hơn ETS 23 lần.
+
+```
+Bài toán cụ thể:
+  5,000,000 session processes
+  Mỗi session cần lookup: "guild_id X đang ở node nào?"
+  Lookup này xảy ra: mỗi khi reconnect, mỗi khi route message
+
+  5,000,000 sessions × 7μs (ETS) = 35 giây chỉ để lookup ring
+  5,000,000 sessions × 0.3μs (FastGlobal) = 1.5 giây ✅
+
+  Với reconnect storm (node restart):
+  ETS:        17.5 giây → cluster overloaded
+  FastGlobal: 750ms → cluster survives
+```
+
+---
+
+## Cơ chế BEAM VM — tại sao module constant đặc biệt
+
+Để hiểu FastGlobal, cần hiểu cách BEAM load và execute code:
+
+```
+BEAM compiled module = series of bytecode instructions
+Mỗi function = list of instructions
+
+Khi function trả về constant:
+  def get_config(), do: %{host: "localhost", port: 5432}
+
+BEAM compiler nhận ra: function này LUÔN trả về cùng 1 giá trị
+→ Optimizer store data vào "literal pool" — vùng nhớ đặc biệt
+→ Literal pool được share giữa TẤT CẢ processes
+→ Không bao giờ bị GC (tồn tại suốt module lifetime)
+→ Đọc = chỉ trả về POINTER tới literal pool
+→ Không copy gì cả
+```
+
+```erlang
+%% Erlang bytecode level (simplified):
+%% Hàm trả về constant:
+get_ring() ->
+    {ok, [node_a, node_b, node_c]}.  %% constant tuple
+
+%% Bytecode:
+%% MOVE {literal, <pointer_to_literal_pool>}, {x, 0}
+%% RETURN
+
+%% "literal" = chỉ đọc pointer — 0 copy
+%% So sánh với ETS:
+%% ETS lookup → find entry → COPY entry vào caller heap
+%% Literal → trả về pointer → 0 copy
+```
+
+---
+
+## FastGlobal — implementation thực sự
+
+Discord port mochiglobal sang Elixir và thêm functionality để tránh tạo atoms. Version của Discord gọi là FastGlobal.
+
+```elixir
+defmodule FastGlobal do
+  @moduledoc """
+  Exploit BEAM literal pool để đọc global data mà không copy.
+
+  Cơ chế:
+    1. Tạo Erlang module mới tại runtime
+    2. Module có 1 function trả về data như literal constant
+    3. BEAM compile module → data vào literal pool
+    4. Đọc = gọi function = nhận pointer = 0 copy
+
+  Trade-off:
+    Read:  0.33μs (23x nhanh hơn ETS)
+    Write: ~44ms  (compile module mới — chậm)
+    → Chỉ tốt khi data read >> write
+  """
+
+  # ── Write — tạo module mới với data ──────────────────────────────
+
+  def put(key, value) do
+    module_name = key_to_module(key)
+
+    # Tạo Erlang abstract syntax tree (AST) cho module mới
+    # Module này có 1 function: get/0 trả về value như literal
+    module_ast = build_module_ast(module_name, value)
+
+    # Compile AST → beam bytecode
+    # Đây là operation tốn kém: ~44ms với data lớn
+    {:ok, ^module_name, beam_binary} =
+      :compile.forms(module_ast, [:return_errors])
+
+    # Load module vào VM — purge version cũ nếu có
+    # Khi purge: BEAM notify tất cả processes đang dùng module cũ
+    # (đây là hidden cost — xem bên dưới)
+    purge_old_module(module_name)
+    :code.load_binary(module_name, ~c"nofile", beam_binary)
+
+    :ok
+  end
+
+  defp build_module_ast(module_name, value) do
+    # Tạo Erlang AST:
+    # -module(module_name).
+    # -export([get/0]).
+    # get() -> VALUE.  ← VALUE được embed như literal
+
+    # Convert Elixir term → Erlang abstract form
+    value_ast = term_to_abstract_form(value)
+
+    [
+      {:attribute, 1, :module, module_name},
+      {:attribute, 1, :export, [{:get, 0}]},
+      {:function, 1, :get, 0,
+        [{:clause, 1, [], [], [value_ast]}]}
+    ]
+  end
+
+  defp term_to_abstract_form(value) when is_integer(value) do
+    {:integer, 1, value}
+  end
+
+  defp term_to_abstract_form(value) when is_atom(value) do
+    {:atom, 1, value}
+  end
+
+  defp term_to_abstract_form(value) when is_binary(value) do
+    {:bin, 1,
+     [{:bin_element, 1,
+       {:string, 1, :erlang.binary_to_list(value)},
+       :default, :default}]}
+  end
+
+  defp term_to_abstract_form(value) when is_list(value) do
+    # Build list AST recursively
+    Enum.reduce_while(Enum.reverse(value), {:nil, 1}, fn elem, acc ->
+      {:cont, {:cons, 1, term_to_abstract_form(elem), acc}}
+    end)
+  end
+
+  defp term_to_abstract_form(value) when is_map(value) do
+    pairs = Enum.map(value, fn {k, v} ->
+      {:map_field_assoc, 1,
+       term_to_abstract_form(k),
+       term_to_abstract_form(v)}
+    end)
+    {:map, 1, pairs}
+  end
+
+  defp term_to_abstract_form({}) do
+    {:tuple, 1, []}
+  end
+
+  defp term_to_abstract_form(tuple) when is_tuple(tuple) do
+    elements = tuple
+      |> Tuple.to_list()
+      |> Enum.map(&term_to_abstract_form/1)
+    {:tuple, 1, elements}
+  end
+
+  # ── Read — gọi function của module ───────────────────────────────
+
+  def get(key) do
+    module_name = key_to_module(key)
+    try do
+      # Gọi module:get() → BEAM trả về pointer tới literal pool
+      # Không copy gì cả
+      # Cost: function call overhead ~0.33μs
+      module_name.get()
+    rescue
+      UndefinedFunctionError -> nil  # key chưa tồn tại
+    end
+  end
+
+  # ── Helpers ───────────────────────────────────────────────────────
+
+  defp key_to_module(key) when is_atom(key) do
+    # Tạo module name từ key
+    # KHÔNG dùng String.to_atom (có thể exhaust atom table)
+    Module.concat([FastGlobal, key])
+  end
+
+  defp key_to_module(key) when is_binary(key) do
+    # Discord version: dùng atom table safe approach
+    # Tránh tạo atom mới từ arbitrary string
+    Module.concat([FastGlobal, Base.encode16(key)])
+  end
+
+  defp purge_old_module(module_name) do
+    case :code.is_loaded(module_name) do
+      {:file, _} ->
+        # Purge old version
+        # ⚠️ Đây là hidden cost: BEAM phải notify mọi process
+        # đang reference module này → cost tỉ lệ với process count
+        :code.purge(module_name)
+        :code.delete(module_name)
+      false ->
+        :ok
+    end
+  end
+end
+```
+
+---
+
+## Benchmark thực tế — so sánh 3 approaches
+
+Benchmark: `fastglobal get` đạt 0.33μs/op so với `ets get` 7.64μs/op và `agent get` 12.67μs/op.
+
+```elixir
+defmodule FastGlobal.Benchmark do
+  def run do
+    data = build_hash_ring()
+
+    # Setup
+    FastGlobal.put(:ring, data)
+    ets_table = setup_ets(data)
+    {:ok, agent} = Agent.start_link(fn -> data end)
+
+    iterations = 10_000_000
+
+    # Benchmark FastGlobal
+    {fg_time, _} = :timer.tc(fn ->
+      Enum.each(1..iterations, fn _ ->
+        FastGlobal.get(:ring)
+      end)
+    end)
+
+    # Benchmark ETS
+    {ets_time, _} = :timer.tc(fn ->
+      Enum.each(1..iterations, fn _ ->
+        :ets.lookup(ets_table, :ring)
+      end)
+    end)
+
+    # Benchmark Agent (GenServer call)
+    {agent_time, _} = :timer.tc(fn ->
+      Enum.each(1..iterations, fn _ ->
+        Agent.get(agent, & &1)
+      end)
+    end)
+
+    IO.puts("FastGlobal: #{fg_time / iterations}μs/op")
+    IO.puts("ETS:        #{ets_time / iterations}μs/op")
+    IO.puts("Agent:      #{agent_time / iterations}μs/op")
+  end
+
+  # Output:
+  # FastGlobal: 0.33μs/op
+  # ETS:        7.64μs/op   ← copy overhead
+  # Agent:      12.67μs/op  ← GenServer message + copy
+end
+```
+
+---
+
+## Tại sao FastGlobal nhanh hơn ETS 23 lần — memory model
+
+```
+ETS.lookup(table, :ring) flow:
+  1. Hash key → find bucket trong ETS hash table    ~100ns
+  2. Lock bucket (read lock)                         ~50ns
+  3. Find entry                                      ~50ns
+  4. COPY entry từ ETS memory → caller heap          ~7,000ns ← bottleneck
+     (hash ring = large data structure)
+  5. Unlock bucket                                   ~50ns
+  Total: ~7,250ns = 7.25μs
+
+FastGlobal.get(:ring) flow:
+  1. Module lookup trong code table                  ~50ns
+  2. Function dispatch                               ~50ns
+  3. Return POINTER tới literal pool                 ~50ns
+     (literal pool = shared read-only memory)
+  4. Caller nhận pointer — ZERO copy                 0ns
+  Total: ~150ns = 0.15μs
+
+Lý do copy là bottleneck trong ETS:
+  Hash ring structure: ~500KB
+  memcpy 500KB: ~5,000ns trên modern hardware
+  → ETS dominated by copy cost, không phải lookup cost
+```
+
+---
+
+## Memory layout — visualize sự khác biệt
+
+---
+
+![beam_memory_fastglobal_vs_ets](beam_memory_fastglobal_vs_ets.svg)
+
+## Discord dùng FastGlobal cho gì cụ thể
+
+```elixir
+defmodule Discord.FastGlobalUsage do
+  @moduledoc """
+  Discord dùng FastGlobal cho data thỏa mãn:
+  1. Read cực kỳ thường xuyên (hàng triệu lần/giây)
+  2. Write rất hiếm (vài lần/giờ hoặc ít hơn)
+  3. Data lớn (đủ để copy cost là bottleneck)
+  4. Cần serve từ bất kỳ process nào (không phải 1 owner)
+  """
+
+  # USE CASE 1: Consistent hash ring
+  # Read: mỗi session cần lookup khi route message
+  # Write: khi node join hoặc leave cluster (hiếm)
+  def update_hash_ring(ring_data) do
+    FastGlobal.put(:hash_ring, ring_data)
+    # ring_data: ~500KB struct với virtual nodes
+  end
+
+  def lookup_node_for_guild(guild_id) do
+    ring = FastGlobal.get(:hash_ring)
+    # 0.33μs — không copy 500KB ring vào caller heap
+    Discord.Router.ConsistentHash.get_node(ring, guild_id)
+  end
+
+  # USE CASE 2: Guild feature flags
+  # Read: mỗi event check features của guild
+  # Write: khi admin thay đổi settings (rất hiếm)
+  def update_guild_features(guild_id, features) do
+    key = :"guild_features_#{guild_id}"
+    FastGlobal.put(key, features)
+  end
+
+  def get_guild_features(guild_id) do
+    FastGlobal.get(:"guild_features_#{guild_id}")
+    # Nếu nil: fallback về ETS hoặc DB
+  end
+
+  # USE CASE 3: Global rate limit config
+  # Read: mỗi incoming request check rate limits
+  # Write: khi engineer thay đổi config (cực hiếm)
+  def update_rate_limit_config(config) do
+    FastGlobal.put(:rate_limit_config, config)
+  end
+
+  def get_rate_limit_config do
+    FastGlobal.get(:rate_limit_config)
+  end
+end
+```
+
+---
+
+## Hidden costs — những gì Discord phát hiện sau khi deploy
+
+Discord sau đó đã bỏ FastGlobal vì phát hiện thời gian compile quá lâu khi purge module với số lượng lớn processes trong system.
+
+```elixir
+defmodule FastGlobal.HiddenCosts do
+  @moduledoc """
+  Những vấn đề FastGlobal gặp phải ở Discord scale
+  """
+
+  # HIDDEN COST 1: Purge cost tăng theo process count
+  def demonstrate_purge_cost do
+    # Khi gọi FastGlobal.put(:ring, new_ring):
+    # 1. Compile module mới: ~1-44ms (tùy data size)
+    # 2. :code.purge(old_module):
+    #    → BEAM gửi signal tới TỪNG process đang reference module cũ
+    #    → Mỗi process phải acknowledge
+    #    → Với 5,000,000 processes: ~30 giây chỉ để purge!
+
+    # Đây là lý do Discord bỏ FastGlobal:
+    # purge_time ∝ process_count
+    # 5M processes × purge_overhead = unacceptable latency
+    :ok
+  end
+
+  # HIDDEN COST 2: Atom table exhaustion
+  # Tạo module name từ dynamic key = tạo atom mới
+  defp bad_key_to_module(key) when is_binary(key) do
+    # ❌ NGUY HIỂM: String.to_atom tạo atom không bao giờ bị GC
+    # Atom table có giới hạn (~1,048,576 atoms mặc định)
+    String.to_atom("fast_global_#{key}")
+  end
+
+  defp good_key_to_module(key) when is_binary(key) do
+    # ✅ AN TOÀN: dùng existing atoms hoặc encode key
+    # FastGlobal.new/1 tạo atom một lần khi startup
+    Module.concat([FastGlobal, Base.encode16(key)])
+    # Base.encode16 trả về binary → Module.concat dùng internal encoding
+    # Không tạo atom mới từ arbitrary string
+  end
+
+  # HIDDEN COST 3: Compile time tăng theo data size
+  def compile_time_analysis do
+    # fastglobal put (5 keys):   ~3,683μs = 3.7ms
+    # fastglobal put (10 keys):  ~6,449μs = 6.4ms
+    # fastglobal put (100 keys): ~44,543μs = 44.5ms
+    # → Linear: mỗi key thêm ~440μs compile time
+
+    # Với hash ring 150 nodes × 150 virtual nodes = 22,500 entries:
+    # Compile time: ~10 giây → không acceptable cho hot update
+    :ok
+  end
+
+  # HIDDEN COST 4: không hoạt động tốt với distributed tracing
+  # Literal pool pointers không carry trace context
+  # → Mọi read trở thành "orphan" span trong distributed trace
+  :ok
+end
+```
+
+---
+
+## Replacement — Discord dùng gì sau khi bỏ FastGlobal
+
+```elixir
+defmodule Discord.PersistentTermApproach do
+  @moduledoc """
+  Erlang/OTP 22+ có :persistent_term — built-in alternative
+  Cùng zero-copy semantics nhưng không cần compile module
+  Và purge cost thấp hơn nhiều
+  """
+
+  # Write: ~microseconds (không compile module)
+  def put(key, value) do
+    :persistent_term.put(key, value)
+    # Tuy nhiên: write vẫn có cost vì phải
+    # scan tất cả processes và invalidate cache
+  end
+
+  # Read: ~nanoseconds, zero-copy (tương đương FastGlobal)
+  def get(key) do
+    :persistent_term.get(key)
+  end
+
+  # Trade-offs của :persistent_term:
+  # ✅ Zero-copy read (same as FastGlobal)
+  # ✅ Không cần compile module
+  # ✅ Built-in, không cần library
+  # ⚠️  Write vẫn expensive ở scale lớn (scan processes)
+  # ⚠️  Chỉ phù hợp cho data thay đổi rất hiếm
+
+  # So sánh:
+  # FastGlobal.put:          ~44ms (compile) + ~30s purge (5M processes)
+  # :persistent_term.put:    ~1ms + scan overhead
+  # ETS write:               ~500ns (fastest write, nhưng copy khi đọc)
+
+  def benchmark_read do
+    :persistent_term.put(:test_data, build_large_structure())
+
+    {time, _} = :timer.tc(fn ->
+      Enum.each(1..10_000_000, fn _ ->
+        :persistent_term.get(:test_data)
+      end)
+    end)
+
+    IO.puts("persistent_term read: #{time / 10_000_000}μs/op")
+    # Output: ~0.35μs/op — tương đương FastGlobal
+  end
+end
+```
+
+---
+
+## Decision tree — chọn storage mechanism nào
+
+```elixir
+defmodule Discord.StorageDecisionGuide do
+  @moduledoc """
+  Hướng dẫn chọn storage tại Discord scale:
+  """
+
+  def choose_storage(opts) do
+    read_freq    = opts[:reads_per_second]   # reads/s
+    write_freq   = opts[:writes_per_second]  # writes/s
+    data_size    = opts[:data_size_bytes]
+    process_count = opts[:concurrent_processes]
+    needs_query  = opts[:needs_filtering]    # cần WHERE clause không
+
+    cond do
+      # Case 1: Đọc >> Ghi, data lớn, không cần query
+      # → :persistent_term (OTP 22+) hoặc FastGlobal (legacy)
+      read_freq > 1_000_000 and
+      write_freq < 10 and
+      data_size > 10_000 ->
+        :persistent_term
+
+      # Case 2: Đọc nhiều, cần query/filter
+      # → ETS với read_concurrency: true
+      read_freq > 100_000 and needs_query ->
+        :ets_with_read_concurrency
+
+      # Case 3: Đọc/Ghi cân bằng, shared giữa processes
+      # → ETS với write_concurrency: true
+      write_freq > 1_000 ->
+        :ets_with_write_concurrency
+
+      # Case 4: Data nhỏ, chỉ 1 process sở hữu
+      # → Process state (GenServer)
+      data_size < 10_000 and process_count == 1 ->
+        :genserver_state
+
+      # Case 5: Cross-node, cần replication
+      # → Mnesia (nhưng Discord đã bỏ — xem Q10)
+      # Thay thế: custom ETS + sync protocol
+      true ->
+        :ets_with_custom_sync
+    end
+  end
+end
+```
+
+---
+
+## Tổng kết — FastGlobal lesson learned
+
+```
+FastGlobal là brilliant hack nhưng có hidden costs:
+
+Lesson 1: Zero-copy read = cực nhanh khi reads >> writes
+          Nhưng writes gây pain tỉ lệ thuận với process count
+
+Lesson 2: Erlang/OTP 22+ có :persistent_term
+          Làm được điều tương tự, ít gotchas hơn
+          Discord đã migrate sang :persistent_term
+
+Lesson 3: Atom table là shared global resource
+          Dynamic atom creation = memory leak
+          Luôn dùng :erlang.binary_to_existing_atom
+          hoặc pre-define atoms khi startup
+
+Lesson 4: Module compile/purge cost không obvious
+          Cần benchmark với production process count
+          Không phải development process count
+
+Benchmark tổng kết:
+  Operation          Latency    Copy?   Write cost   Use when
+  ──────────────────────────────────────────────────────────────
+  Process heap       ~1ns       No      N/A          local state
+  :persistent_term   ~0.35μs   No      ~1ms         global, rare write
+  FastGlobal         ~0.33μs   No      ~44ms+purge  legacy, avoid now
+  ETS lookup         ~7.64μs   Yes     ~500ns       shared, queryable
+  GenServer.call     ~12.67μs  Yes     N/A          coordinated access
+  Remote send/2      ~70μs     Yes     N/A          cross-node
+```
+
+---
+
