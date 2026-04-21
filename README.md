@@ -1435,3 +1435,695 @@ Và active_members << total_members ở mọi guild lớn
 ```
 
 ---
+
+# Q4: Relay Process Layer — State, Sync, và Coordination với Guild
+
+---
+
+## Tại sao Relay ra đời — giới hạn vật lý của single BEAM process
+
+Sau khi có passive sessions, active members giảm từ 1M xuống ~100K. Nhưng 100K vẫn là quá nhiều cho 1 process:
+
+```
+1 Guild process với 100,000 active sessions:
+
+Fanout 1 message:
+  100,000 sends × 70μs = 7 giây  ← vẫn không chấp nhận được
+
+Vấn đề cốt lõi:
+  BEAM process = single-threaded
+  Dù máy có 64 cores, guild chỉ dùng được 1 core
+  Không có cách nào parallelize work trong 1 process
+
+Giải pháp duy nhất: chia work ra nhiều processes
+→ Relay layer ra đời
+```
+
+---
+
+## Mental model: Guild là "brain", Relay là "arms"
+
+```
+TRƯỚC relay:                  SAU relay:
+
+Guild (brain + arms):         Guild (chỉ là brain):
+  - Giữ toàn bộ member list    - Giữ guild-level state
+  - Tự fanout tới sessions      - Delegate fanout cho relays
+  - Check permissions           - Không biết sessions trực tiếp
+  - Handle voice state
+  - Handle member list
+
+                               Relay (arms):
+                                 - Giữ subset of sessions
+                                 - Tự fanout tới sessions của mình
+                                 - Check permissions locally
+                                 - Handle member list cho subset
+```
+
+---
+
+## Phân chia state — ai giữ gì
+
+---
+
+![guild_relay_state_distribution](guild_relay_state_distribution.svg)
+
+## Relay Implementation — full code
+
+```elixir
+defmodule Discord.Relay.Process do
+  use GenServer
+
+  @max_sessions_per_relay 15_000
+
+  defstruct [
+    :relay_id,
+    :guild_id,
+    :guild_pid,
+    :ets_member_table,    # ref tới ETS table của guild (không copy)
+
+    # Sessions thuộc relay này
+    sessions: %{},        # %{user_id => %{pid, node}}
+
+    # Permission cache — đắt để compute, cache lại
+    # %{user_id => %{channel_id => permission_bits}}
+    permission_cache: %{},
+
+    # Presence snapshot của toàn guild (nhận từ guild qua sync)
+    presence_snapshot: %{},
+
+    # Track capacity
+    session_count: 0,
+  ]
+
+  def start_link(opts) do
+    relay_id = Keyword.fetch!(opts, :relay_id)
+    guild_id = Keyword.fetch!(opts, :guild_id)
+    GenServer.start_link(__MODULE__, opts,
+      name: {:via, Registry, {Discord.RelayRegistry, {guild_id, relay_id}}}
+    )
+  end
+
+  def init(opts) do
+    guild_id  = Keyword.fetch!(opts, :guild_id)
+    relay_id  = Keyword.fetch!(opts, :relay_id)
+    guild_pid = Keyword.fetch!(opts, :guild_pid)
+
+    # Nhận initial state từ guild khi được spawn
+    initial_state = GenServer.call(guild_pid, {:relay_init, relay_id, self()})
+
+    state = %__MODULE__{
+      relay_id:         relay_id,
+      guild_id:         guild_id,
+      guild_pid:        guild_pid,
+      ets_member_table: initial_state.ets_table,
+      presence_snapshot: initial_state.presence_snapshot,
+    }
+
+    {:ok, state}
+  end
+
+  # ── Session management ──────────────────────────────────────────────
+
+  def handle_cast({:session_join, user_id, session_pid}, state) do
+    # Monitor session — biết khi nào user disconnect
+    Process.monitor(session_pid)
+
+    # Pre-compute permissions khi join — không compute lại mỗi message
+    permissions = compute_permissions(user_id, state)
+
+    new_sessions = Map.put(state.sessions, user_id, %{
+      pid:  session_pid,
+      node: node(session_pid)
+    })
+
+    new_permission_cache = Map.put(state.permission_cache, user_id, permissions)
+
+    # Gửi initial state sync cho session mới join
+    send_initial_sync(session_pid, state)
+
+    new_state = %{state |
+      sessions:         new_sessions,
+      permission_cache: new_permission_cache,
+      session_count:    state.session_count + 1
+    }
+
+    {:noreply, new_state}
+  end
+
+  def handle_cast({:session_leave, user_id}, state) do
+    new_state = %{state |
+      sessions:         Map.delete(state.sessions, user_id),
+      permission_cache: Map.delete(state.permission_cache, user_id),
+      session_count:    state.session_count - 1
+    }
+    {:noreply, new_state}
+  end
+
+  # Session crash hoặc disconnect
+  def handle_info({:DOWN, _ref, :process, dead_pid, _reason}, state) do
+    # Tìm user_id của dead session
+    case find_user_by_pid(state.sessions, dead_pid) do
+      nil -> {:noreply, state}
+
+      user_id ->
+        # Cleanup local state
+        new_state = %{state |
+          sessions:         Map.delete(state.sessions, user_id),
+          permission_cache: Map.delete(state.permission_cache, user_id),
+          session_count:    state.session_count - 1
+        }
+
+        # Notify guild: user này disconnect
+        GenServer.cast(state.guild_pid,
+          {:session_disconnected, user_id, state.relay_id})
+
+        {:noreply, new_state}
+    end
+  end
+
+  # ── Fanout — core responsibility của relay ──────────────────────────
+
+  def handle_info({:relay_broadcast, message, opts}, state) do
+    channel_id = message.channel_id
+
+    # Filter: chỉ gửi tới sessions có thể xem channel này
+    eligible_pids = state.sessions
+      |> Enum.filter(fn {user_id, _session} ->
+        can_read_channel?(user_id, channel_id, state.permission_cache)
+      end)
+      |> Enum.map(fn {_user_id, %{pid: pid}} -> pid end)
+
+    # Gửi song song qua Manifold
+    Manifold.send(eligible_pids, {:new_message, message})
+
+    {:noreply, state}
+  end
+
+  def handle_info({:relay_presence_update, user_id, status}, state) do
+    # Update local presence snapshot
+    new_snapshot = Map.put(state.presence_snapshot, user_id, status)
+
+    # Fanout tới tất cả sessions trong relay này
+    # (presence không cần permission check)
+    pids = Map.values(state.sessions) |> Enum.map(& &1.pid)
+    Manifold.send(pids, {:presence_update, user_id, status})
+
+    {:noreply, %{state | presence_snapshot: new_snapshot}}
+  end
+
+  # ── Permission computation ──────────────────────────────────────────
+
+  defp compute_permissions(user_id, state) do
+    # Đọc member data từ ETS (shared với guild — không copy)
+    member = :ets.lookup(state.ets_member_table, user_id)
+      |> List.first()
+      |> elem(1)
+
+    # Compute permission bits cho mọi channel
+    # (một lần khi join, cache lại)
+    channels = get_guild_channels(state.guild_id)
+
+    Enum.reduce(channels, %{}, fn channel, acc ->
+      bits = Discord.Permissions.compute(
+        member.roles,
+        channel.permission_overwrites,
+        channel.id
+      )
+      Map.put(acc, channel.id, bits)
+    end)
+  end
+
+  defp can_read_channel?(user_id, channel_id, permission_cache) do
+    case get_in(permission_cache, [user_id, channel_id]) do
+      nil   -> false   # không có trong cache → assume không có quyền
+      bits  -> Discord.Permissions.can_read_messages?(bits)
+    end
+  end
+end
+```
+
+---
+
+## Guild Process — quản lý relay pool
+
+```elixir
+defmodule Discord.Guild.Process do
+  # Guild không fanout tới sessions trực tiếp nữa
+  # Guild chỉ quản lý relay pool và broadcast tới relays
+
+  def handle_cast({:new_message, message}, state) do
+    # Guild broadcast tới tất cả relay processes
+    # Relay tự lo filter + fanout tới sessions của mình
+    relay_pids = Map.values(state.relay_registry)
+
+    Manifold.send(relay_pids, {:relay_broadcast, message, %{}})
+
+    {:noreply, state}
+  end
+
+  # ── Relay lifecycle management ──────────────────────────────────────
+
+  def handle_cast({:session_connected, user_id, session_pid}, state) do
+    # Chọn relay phù hợp cho session mới
+    relay_pid = select_relay(state)
+
+    # Assign session cho relay
+    GenServer.cast(relay_pid, {:session_join, user_id, session_pid})
+
+    # Cập nhật tracking
+    new_session_to_relay = Map.put(
+      state.session_to_relay,
+      user_id,
+      relay_pid
+    )
+
+    {:noreply, %{state | session_to_relay: new_session_to_relay}}
+  end
+
+  def handle_cast({:session_disconnected, user_id, relay_id}, state) do
+    new_session_to_relay = Map.delete(state.session_to_relay, user_id)
+
+    # Check nếu relay đang quá ít sessions → có thể merge
+    maybe_consolidate_relays(relay_id, state)
+
+    {:noreply, %{state | session_to_relay: new_session_to_relay}}
+  end
+
+  # ── Relay selection — load balancing ───────────────────────────────
+
+  defp select_relay(state) do
+    # Tìm relay có ít sessions nhất mà vẫn còn capacity
+    state.relay_registry
+    |> Enum.min_by(fn {_id, pid} ->
+      GenServer.call(pid, :session_count)
+    end)
+    |> then(fn {_id, pid} ->
+      # Nếu relay đã full → spawn relay mới
+      count = GenServer.call(pid, :session_count)
+      if count >= @max_sessions_per_relay do
+        spawn_new_relay(state)
+      else
+        pid
+      end
+    end)
+  end
+
+  defp spawn_new_relay(state) do
+    relay_id = generate_relay_id()
+    {:ok, pid} = Discord.Relay.DynamicSupervisor.start_child(%{
+      relay_id: relay_id,
+      guild_id: state.guild_id,
+      guild_pid: self()
+    })
+
+    # Update registry
+    new_registry = Map.put(state.relay_registry, relay_id, pid)
+    # (trong thực tế: gửi update registry về state qua handle_continue)
+    pid
+  end
+
+  # Relay init request — gửi initial state cho relay mới
+  def handle_call({:relay_init, _relay_id, _relay_pid}, _from, state) do
+    initial = %{
+      ets_table:         state.ets_member_table,
+      presence_snapshot: build_presence_snapshot(state),
+      channels:          state.channels,
+    }
+    {:reply, initial, state}
+  end
+end
+```
+
+---
+
+## Sync protocol — guild và relay luôn consistent
+
+Đây là phần phức tạp nhất. Khi guild state thay đổi, relay cần được cập nhật:
+
+```elixir
+defmodule Discord.Guild.SyncProtocol do
+  @moduledoc """
+  Protocol đồng bộ state giữa guild và relay processes.
+
+  Nguyên tắc:
+    Guild là source of truth
+    Relay nhận delta updates — không nhận full state mỗi lần
+    Relay có thể có stale state trong khoảng thời gian ngắn (eventual consistency)
+    Cho các thao tác critical (permission check): query guild directly
+  """
+
+  # ── Guild gửi delta updates tới tất cả relays ──────────────────────
+
+  # Member join guild (không phải join relay)
+  def sync_member_join(guild_state, user_id, member_data) do
+    # 1. Update ETS — relay đọc được ngay vì shared memory
+    :ets.insert(guild_state.ets_member_table, {user_id, member_data})
+
+    # 2. Notify relays để update permission cache
+    event = {:member_joined, user_id, member_data}
+    broadcast_to_relays(guild_state.relay_registry, event)
+  end
+
+  def sync_member_leave(guild_state, user_id) do
+    :ets.delete(guild_state.ets_member_table, user_id)
+    broadcast_to_relays(guild_state.relay_registry, {:member_left, user_id})
+  end
+
+  # Role thay đổi → permissions thay đổi → phải invalidate cache
+  def sync_role_update(guild_state, role_id, new_role_data) do
+    event = {:role_updated, role_id, new_role_data}
+    broadcast_to_relays(guild_state.relay_registry, event)
+    # Relay sẽ recompute permissions cho tất cả members có role này
+  end
+
+  # Channel permission overwrites thay đổi
+  def sync_channel_update(guild_state, channel_id, new_channel_data) do
+    event = {:channel_updated, channel_id, new_channel_data}
+    broadcast_to_relays(guild_state.relay_registry, event)
+  end
+
+  defp broadcast_to_relays(relay_registry, event) do
+    relay_pids = Map.values(relay_registry)
+    Manifold.send(relay_pids, event)
+  end
+end
+```
+
+```elixir
+# Relay xử lý sync events từ guild
+defmodule Discord.Relay.Process do
+  # ... (tiếp phần handle_info)
+
+  def handle_info({:member_joined, user_id, member_data}, state) do
+    # Member join guild nhưng chưa chắc join relay này
+    # Chỉ cần prepare permission computation nếu họ sẽ connect sau
+    # (lazy — không compute ngay vì tốn CPU)
+    {:noreply, state}
+  end
+
+  def handle_info({:member_left, user_id}, state) do
+    # Cleanup nếu member này đang trong relay
+    new_state = %{state |
+      sessions:         Map.delete(state.sessions, user_id),
+      permission_cache: Map.delete(state.permission_cache, user_id),
+    }
+    {:noreply, new_state}
+  end
+
+  def handle_info({:role_updated, role_id, new_role_data}, state) do
+    # Invalidate permission cache cho tất cả members có role này
+    # Cần recompute từ ETS (shared với guild)
+    affected_users = find_users_with_role(state, role_id)
+
+    new_permission_cache = Enum.reduce(
+      affected_users,
+      state.permission_cache,
+      fn user_id, cache ->
+        new_perms = compute_permissions(user_id, state)
+        Map.put(cache, user_id, new_perms)
+      end
+    )
+
+    {:noreply, %{state | permission_cache: new_permission_cache}}
+  end
+
+  def handle_info({:channel_updated, channel_id, _new_data}, state) do
+    # Channel permission thay đổi → invalidate permission cache
+    # cho tất cả users với channel đó
+    new_permission_cache = state.permission_cache
+      |> Enum.map(fn {user_id, channel_perms} ->
+        # Recompute chỉ channel bị affected
+        new_channel_perm = recompute_channel_permission(
+          user_id, channel_id, state
+        )
+        new_channel_perms = Map.put(channel_perms, channel_id, new_channel_perm)
+        {user_id, new_channel_perms}
+      end)
+      |> Map.new()
+
+    {:noreply, %{state | permission_cache: new_permission_cache}}
+  end
+end
+```
+
+---
+
+## Guild migration — handoff relay state không mất message
+
+Khi cần hand off guild process từ machine này sang machine khác, cần copy state có thể lên tới nhiều GB. Discord dùng ETS và worker processes để làm điều này trong khi guild vẫn tiếp tục xử lý messages.
+
+```elixir
+defmodule Discord.Guild.Migration do
+  @moduledoc """
+  Live migration guild process sang node khác.
+  Challenge: guild state có thể nhiều GB (ETS member table)
+  Requirement: không mất message nào trong quá trình migrate
+  """
+
+  def migrate(guild_id, source_node, target_node) do
+    source_pid = get_guild_pid(guild_id, source_node)
+
+    # Phase 1: Khởi động guild mới trên target node
+    # Guild mới chạy ở chế độ "shadow" — nhận events nhưng chưa serve
+    {:ok, shadow_pid} = :rpc.call(
+      target_node,
+      Discord.Guild.DynamicSupervisor,
+      :start_shadow,
+      [guild_id, source_pid]
+    )
+
+    # Phase 2: Copy ETS table (có thể GB) qua mạng
+    # Dùng worker process — guild cũ KHÔNG bị block
+    copy_worker = spawn_link(fn ->
+      stream_ets_to_target(
+        source_pid,
+        shadow_pid,
+        chunk_size: 1_000  # 1000 rows mỗi lần
+      )
+    end)
+
+    # Guild cũ vẫn serve traffic trong khi copy
+    # Shadow guild nhận được copy + buffer events mới
+
+    # Phase 3: Chờ copy xong
+    receive do
+      {:copy_complete, ^copy_worker} -> :ok
+    after
+      60_000 -> {:error, :copy_timeout}
+    end
+
+    # Phase 4: Atomic cutover
+    # Trong ~1ms: chuyển tất cả traffic từ source sang target
+    :ok = GenServer.call(source_pid, {:prepare_cutover, shadow_pid})
+    :ok = Discord.Router.update_ring(guild_id, target_node)
+    :ok = GenServer.cast(source_pid, :complete_cutover)
+
+    # Phase 5: Drain và stop source
+    # Source tiếp tục redirect incoming requests sang target
+    # trong vài giây để handle in-flight requests
+    Process.send_after(source_pid, :stop_after_drain, 5_000)
+  end
+
+  defp stream_ets_to_target(source_pid, shadow_pid, opts) do
+    chunk_size = opts[:chunk_size]
+
+    # Đọc ETS table từng chunk — không lock guild process
+    stream_ets_chunks(source_pid, chunk_size, fn chunk ->
+      GenServer.call(shadow_pid, {:load_member_chunk, chunk})
+    end)
+
+    send(self(), {:copy_complete, self()})
+  end
+end
+```
+
+---
+
+## Relay consolidation — cleanup khi users offline
+
+```elixir
+defmodule Discord.Guild.RelayConsolidator do
+  @moduledoc """
+  Khi users offline, relay có thể trở nên quá thưa.
+  Consolidate relays để tránh lãng phí processes.
+  """
+
+  @min_sessions_to_keep 1_000  # relay có < 1000 sessions → candidate merge
+  @check_interval 60_000       # check mỗi phút
+
+  def schedule_consolidation(guild_state) do
+    Process.send_after(self(), :consolidate_relays, @check_interval)
+    guild_state
+  end
+
+  def handle_info(:consolidate_relays, state) do
+    {sparse_relays, healthy_relays} =
+      state.relay_registry
+      |> Enum.split_with(fn {_id, pid} ->
+        GenServer.call(pid, :session_count) < @min_sessions_to_keep
+      end)
+
+    if length(sparse_relays) >= 2 do
+      # Merge 2 sparse relays vào 1
+      [{_id1, pid1}, {_id2, pid2} | _rest] = sparse_relays
+
+      # Move tất cả sessions từ pid2 sang pid1
+      sessions_to_move = GenServer.call(pid2, :get_all_sessions)
+
+      Enum.each(sessions_to_move, fn {user_id, session_pid} ->
+        GenServer.cast(pid1, {:session_join, user_id, session_pid})
+        GenServer.cast(pid2, {:session_leave, user_id})
+      end)
+
+      # Stop relay trống
+      GenServer.stop(pid2, :normal)
+
+      new_registry = Map.delete(state.relay_registry, elem(pid2_entry, 0))
+      schedule_consolidation(%{state | relay_registry: new_registry})
+    else
+      schedule_consolidation(state)
+    end
+
+    {:noreply, state}
+  end
+end
+```
+
+---
+
+## Full message flow với relay layer
+
+```
+User A gửi message vào #general (Guild X, 1M members, 100K active):
+
+① Phoenix Channel nhận WS frame
+   └─ Session_A cast tới Guild_X: {:new_message, msg}        ~1μs
+
+② Guild_X handle_cast:
+   └─ relay_pids = Map.values(relay_registry)  # 7 relay PIDs
+   └─ Manifold.send(relay_pids, {:relay_broadcast, msg})     ~500μs
+   └─ Guild_X free ✅
+
+③ 7 Relay processes nhận broadcast (PARALLEL trên nhiều nodes):
+   Mỗi relay:
+   └─ Filter sessions có thể xem #general                   ~2ms
+      (lookup permission_cache — O(1) per user)
+   └─ Manifold.send(eligible_pids, {:new_message, msg})      ~5ms
+   └─ Relay free ✅
+
+④ ~14,000 sessions per relay nhận message                    ~1μs
+   └─ Push qua WebSocket tới client                          ~50μs
+
+Tổng:
+  Guild blocked:  ~500μs   (thay vì 7 giây)
+  Full delivery:  ~8ms p50 (thay vì không thể)
+  Permission check: in relay, không block guild
+```
+
+---
+
+## Supervision tree cho relay pool
+
+```elixir
+defmodule Discord.Relay.DynamicSupervisor do
+  use DynamicSupervisor
+
+  def start_link(_) do
+    DynamicSupervisor.start_link(__MODULE__, [], name: __MODULE__)
+  end
+
+  def init(_), do: DynamicSupervisor.init(strategy: :one_for_one)
+
+  def start_child(opts) do
+    spec = {Discord.Relay.Process, opts}
+    DynamicSupervisor.start_child(__MODULE__, spec)
+  end
+
+  # Relay crash → supervisor restart relay
+  # Guild detect relay down qua Process.monitor
+  # Guild reassign sessions của relay chết sang relays còn sống
+end
+
+defmodule Discord.Guild.Process do
+  def init(guild_id) do
+    # Monitor tất cả relay processes
+    # Tự detect khi relay crash → reassign sessions
+    state = %__MODULE__{guild_id: guild_id}
+    {:ok, state, {:continue, :setup_relay_monitors}}
+  end
+
+  def handle_continue(:setup_relay_monitors, state) do
+    Enum.each(state.relay_registry, fn {_id, pid} ->
+      Process.monitor(pid)
+    end)
+    {:noreply, state}
+  end
+
+  # Relay crash
+  def handle_info({:DOWN, _ref, :process, dead_relay_pid, reason}, state) do
+    require Logger
+    Logger.error("Relay crashed: #{inspect(dead_relay_pid)}, reason: #{inspect(reason)}")
+
+    # Tìm relay ID của dead relay
+    {dead_relay_id, _} = Enum.find(
+      state.relay_registry,
+      fn {_id, pid} -> pid == dead_relay_pid end
+    )
+
+    # Lấy danh sách sessions của relay đã chết
+    # (guild track session_to_relay mapping)
+    orphaned_users = state.session_to_relay
+      |> Enum.filter(fn {_uid, relay_pid} -> relay_pid == dead_relay_pid end)
+      |> Enum.map(fn {uid, _} -> uid end)
+
+    # Spawn relay mới và reassign sessions
+    {:ok, new_relay_pid} = Discord.Relay.DynamicSupervisor.start_child(%{
+      relay_id: generate_relay_id(),
+      guild_id: state.guild_id,
+      guild_pid: self()
+    })
+
+    # Sessions phải reconnect tới relay mới
+    # Session process nhận {:reassign_relay, new_relay_pid}
+    Enum.each(orphaned_users, fn user_id ->
+      case Map.get(state.session_to_relay, user_id) do
+        nil -> :ok
+        _   ->
+          session_pid = get_session_pid(user_id)
+          send(session_pid, {:reassign_relay, new_relay_pid})
+      end
+    end)
+
+    new_registry = state.relay_registry
+      |> Map.delete(dead_relay_id)
+      |> Map.put(generate_relay_id(), new_relay_pid)
+
+    {:noreply, %{state | relay_registry: new_registry}}
+  end
+end
+```
+
+---
+
+## Tóm tắt — phân chia trách nhiệm rõ ràng
+
+```
+Responsibility          Guild           Relay
+────────────────────────────────────────────────────
+Source of truth         ✅ guild meta   ✅ session list
+Member data             ✅ ETS owner    📖 ETS reader
+Permission compute      ❌ delegate     ✅ per session
+Fanout to sessions      ❌ delegate     ✅ per message
+Voice state             ✅ owns         ❌ proxy only
+Relay lifecycle         ✅ spawn/kill   ❌ managed
+Session assignment      ✅ routing      ❌ receives only
+Presence updates        ✅ aggregates   ✅ fan out local
+
+Key insight:
+Guild process = coordinator, không làm heavy lifting
+Relay process = worker, làm fanout + permission check
+ETS = shared memory bridge giữa guild và relays
+```
+
+---
