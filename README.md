@@ -4665,7 +4665,11 @@ Relationships:
 
 ---
 
-## Timeline đầy đủ — 40 giây breakdown---
+## Timeline đầy đủ — 40 giây breakdown
+
+![recovery_timeline](recovery_timeline.svg)
+
+---
 
 ## Phase 1: t=0 → t=2s — Detection
 
