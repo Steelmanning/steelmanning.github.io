@@ -5824,3 +5824,612 @@ Thay thế tốt hơn:
 ```
 
 ---
+
+# Q11: Distributed Tracing trong Actor Model — Transport Library và Dynamic Sampling
+
+*Bài toán observability khó nhất: trace 1 message qua 1 triệu actors*
+
+---
+
+## Tại sao distributed tracing trong actor model khác hoàn toàn HTTP
+
+```
+HTTP-based tracing (quen thuộc):
+  Request A → Service 1 → Service 2 → Service 3
+  1 trace = 1 request = linear chain
+  Mỗi hop: inject trace_id vào HTTP header
+  → OpenTelemetry/Jaeger handle tốt
+
+Actor model tracing (Discord's challenge):
+  1 message → guild process → fanout → 1,000,000 actors → 1,000,000 sessions
+  1 trace = 1 event = exponential fan
+  Không có "HTTP header" để inject
+  → Standard OpenTelemetry KHÔNG scale
+```
+
+```
+Nếu trace mọi hop trong Discord:
+
+User gửi 1 message vào guild 1,000,000 members:
+  1 root span (message received)
+  + 1 span (guild process)
+  + 1,000,000 child spans (mỗi session delivery)
+  = 1,000,002 spans cho 1 message
+
+Discord có: ~100,000 messages/giây vào large guilds
+→ 100,000 × 1,000,002 spans/giây
+→ 100 billion spans/giây
+→ Observability infrastructure sẽ explode ngay lập tức
+```
+
+---
+
+## Vấn đề cụ thể Discord gặp phải
+
+Discord's architecture tạo ra unique scaling challenges. Khi một user gửi message tới guild với 1 triệu online members, một traced operation có thể spawn ra 1 triệu child spans, một per session. Khi deploy distributed tracing ban đầu, các guild bận nhất bắt đầu không theo kịp activity. Profiling cho thấy processes tốn thời gian đáng kể để unpack trace context, ngay cả khi 99%+ operations không được sampled.
+
+```elixir
+defmodule Discord.Tracing.Problem do
+  @moduledoc "Minh họa vấn đề naive tracing"
+
+  # Naive approach — làm CHẬM cả guild
+  def naive_fanout_with_trace(message, sessions, trace_ctx) do
+    span = Tracer.start_span("guild.fanout", parent: trace_ctx)
+
+    Enum.each(sessions, fn session_pid ->
+      # Mỗi send kèm theo trace context
+      # Context phải được serialize vào message
+      # → Tăng message size
+      # → Tăng serialization cost
+      # → Mỗi session phải deserialize context
+      send(session_pid, {message, trace_ctx})
+      #                            ^^^^^^^^^^
+      #                            thêm ~200 bytes per message
+      #                            × 1,000,000 = 200MB extra per fanout
+    end)
+
+    Tracer.finish_span(span)
+  end
+
+  # Profile result (Discord's actual numbers):
+  # Before tracing:  guild fanout CPU = 45%
+  # After naive tracing: guild fanout CPU = 65% (+20%)
+  # Cause: serialize/deserialize context × 1,000,000
+end
+```
+
+---
+
+## Discord's Transport Library — wrap message passing
+
+Thay vì instrument HTTP layer, Discord wrap chính `send/2` của BEAM:
+
+```elixir
+defmodule Discord.Transport do
+  @moduledoc """
+  Wrap Erlang message passing để inject trace context.
+
+  Key design decisions:
+  1. Không dùng process dictionary (anti-pattern, không visible)
+  2. Wrap message structure thay vì modify process state
+  3. Receiver tự quyết có unpack context không
+  4. Sampling decision propagate theo message
+  """
+
+  # Message format với trace context
+  # {:transport_msg, original_message, trace_envelope}
+  defmodule Envelope do
+    defstruct [
+      :trace_id,
+      :span_id,
+      :sampled,        # boolean — có trace không?
+      :baggage,        # key-value metadata
+    ]
+    # Compact: chỉ 4 fields, ~50 bytes khi serialized
+    # Quan trọng: :sampled field đọc được mà không deserialize toàn bộ
+  end
+
+  # ── Send với trace context ────────────────────────────────────
+
+  def send(pid, message) do
+    case get_current_trace() do
+      nil ->
+        # Không có trace context → send bình thường, zero overhead
+        Kernel.send(pid, message)
+
+      %Envelope{sampled: false} = env ->
+        # Có trace nhưng không sampled → propagate nhưng không record
+        # Receiver biết context nhưng không tạo spans
+        Kernel.send(pid, {:transport_msg, message, %{env | baggage: nil}})
+        # Shrink envelope: bỏ baggage khi không sampled
+
+      %Envelope{} = env ->
+        # Sampled → propagate full context
+        Kernel.send(pid, {:transport_msg, message, env})
+    end
+  end
+
+  # ── Receive — unpack nếu có envelope ─────────────────────────
+
+  defmacro handle_transport(pattern, do: block) do
+    quote do
+      def handle_info({:transport_msg, unquote(pattern), trace_env}, state) do
+        # Set trace context cho process này
+        Discord.Transport.set_current_trace(trace_env)
+        result = unquote(block)
+        Discord.Transport.clear_current_trace()
+        result
+      end
+
+      # Backward compatible: handle non-transport messages
+      def handle_info(unquote(pattern), state) do
+        unquote(block)
+      end
+    end
+  end
+
+  # Lưu trace context trong process dictionary
+  # (acceptable vì chỉ dùng nội bộ trong 1 message handler)
+  def get_current_trace do
+    Process.get(:transport_trace_context)
+  end
+
+  def set_current_trace(env) do
+    Process.put(:transport_trace_context, env)
+  end
+
+  def clear_current_trace do
+    Process.delete(:transport_trace_context)
+  end
+end
+```
+
+---
+
+## Dynamic Sampling — core innovation
+
+Discord implement dynamic sampling dựa trên fanout size. Messages gửi tới 1 recipient giữ sampling decision 100% thời gian. Messages fanned out tới 100 recipients giảm xuống 10% sampling. Ở 10,000+ recipients, chỉ 0.1% sessions capture spans.
+
+```elixir
+defmodule Discord.Tracing.DynamicSampler do
+  @moduledoc """
+  Sample rate tỉ lệ nghịch với fanout size.
+  Đảm bảo: tổng spans/giây không vượt quá budget.
+  """
+
+  # Target: tối đa 10,000 spans/giây từ fanout operations
+  @max_spans_per_second 10_000
+
+  # Tính sample rate dựa trên số recipients
+  def sample_rate_for_fanout(recipient_count) do
+    cond do
+      recipient_count <= 1 ->
+        1.0          # 100% — point-to-point, cheap
+
+      recipient_count <= 10 ->
+        1.0          # 100% — small fanout
+
+      recipient_count <= 100 ->
+        0.1          # 10% — medium fanout
+
+      recipient_count <= 1_000 ->
+        0.01         # 1%
+
+      recipient_count <= 10_000 ->
+        0.001        # 0.1%
+
+      recipient_count <= 100_000 ->
+        0.0001       # 0.01%
+
+      true ->
+        0.00001      # 0.001% — 1 triệu recipients
+    end
+    # Expected spans với 1,000,000 recipients × 0.001% = 10 spans
+    # 10 spans × 100,000 messages/giây = 1,000,000 spans/giây
+    # Vẫn quá nhiều → cần thêm upstream sampling
+  end
+
+  # Quyết định có sample không — deterministic dựa trên trace_id
+  # Đảm bảo: cùng trace_id → cùng quyết định trên mọi node
+  def should_sample?(trace_id, sample_rate) do
+    # Hash trace_id → [0, 1) uniform distribution
+    hash = :erlang.phash2(trace_id, 1_000_000) / 1_000_000
+    hash < sample_rate
+  end
+
+  # Apply sampling tại fanout point
+  def sample_fanout(trace_env, recipient_pids) do
+    count = length(recipient_pids)
+    rate  = sample_rate_for_fanout(count)
+
+    Enum.map(recipient_pids, fn pid ->
+      # Mỗi recipient nhận sampling decision riêng
+      # Nhưng deterministic: cùng trace → cùng kết quả
+      sampled = should_sample?(trace_env.trace_id, rate)
+      {pid, %{trace_env | sampled: sampled}}
+    end)
+  end
+end
+```
+
+---
+
+## Implementation trong Guild Process
+
+```elixir
+defmodule Discord.Guild.Process do
+  use GenServer
+
+  # Nhận message với trace context
+  def handle_info(
+    {:transport_msg, {:new_message, message}, trace_env},
+    state
+  ) do
+    span = if trace_env.sampled do
+      Discord.Tracer.start_span("guild.message_received",
+        parent:     trace_env,
+        attributes: %{
+          guild_id:       state.guild_id,
+          channel_id:     message.channel_id,
+          active_members: map_size(state.active_sessions),
+        }
+      )
+    end
+
+    # Fanout với dynamic sampling
+    active_pids = Map.values(state.active_sessions)
+    fanout_count = length(active_pids)
+
+    sampled_pids = Discord.Tracing.DynamicSampler.sample_fanout(
+      trace_env,
+      active_pids
+    )
+
+    # Gửi mỗi session với sampling decision riêng
+    Enum.each(sampled_pids, fn {pid, recipient_env} ->
+      Discord.Transport.send(pid, {:new_message, message})
+      # Transport.send tự inject recipient_env vào message
+    end)
+
+    if span do
+      Discord.Tracer.finish_span(span, %{
+        recipients_total:   fanout_count,
+        recipients_sampled: Enum.count(sampled_pids, fn {_, e} -> e.sampled end),
+      })
+    end
+
+    {:noreply, state}
+  end
+end
+```
+
+---
+
+## Optimization 1: Skip context khi không sampled
+
+Optimization quan trọng nhất: sessions bị cấm bắt đầu new traces sau khi nhận fanned-out messages. Sessions có thể continue existing traces, nhưng sẽ không independently quyết định sample. Change này recover gần như toàn bộ overhead, giảm CPU usage từ 55% xuống 45%.
+
+```elixir
+defmodule Discord.Session.Process do
+  use GenServer
+
+  def handle_info(
+    {:transport_msg, {:new_message, message}, trace_env},
+    state
+  ) do
+    # CRITICAL OPTIMIZATION:
+    # Session KHÔNG bắt đầu trace mới từ fanout messages
+    # Chỉ continue nếu upstream đã sampled
+
+    if trace_env.sampled do
+      # Upstream sampled → tạo span cho delivery
+      span = Discord.Tracer.start_span("session.message_delivered",
+        parent:     trace_env,
+        attributes: %{
+          user_id:    state.user_id,
+          latency_ms: compute_latency(message),
+        }
+      )
+
+      deliver_to_websocket(message, state)
+
+      Discord.Tracer.finish_span(span)
+    else
+      # Không sampled → deliver trực tiếp, zero overhead
+      # Không tạo span, không deserialize full context
+      deliver_to_websocket(message, state)
+    end
+
+    {:noreply, state}
+  end
+
+  # Sessions KHÔNG thể bắt đầu trace mới từ fanout
+  # Ngăn chặn: session tự quyết sample → nhân explosion spans
+  def handle_info({:new_message, message}, state) do
+    # Message không có trace context → deliver bình thường
+    # Session không create trace riêng cho delivery
+    deliver_to_websocket(message, state)
+    {:noreply, state}
+  end
+end
+```
+
+---
+
+## Optimization 2: Fast-path cho unsampled context
+
+Optimization quan trọng nhất đến từ gRPC request handling. 75% thời gian xử lý request là để unpack trace context. Discord build filter đọc sampling flag từ encoded trace context string mà không cần full deserialization. Nếu trace không sampled, context không được propagate.
+
+```elixir
+defmodule Discord.Tracing.FastPath do
+  @moduledoc """
+  Đọc sampling flag mà không deserialize toàn bộ context.
+  Critical cho high-throughput paths.
+  """
+
+  # Trace context format (compact binary):
+  # <<version, trace_id::128, span_id::64, flags::8>>
+  # Total: ~18 bytes
+
+  # flags byte: bit 0 = sampled
+  @sampled_flag 0x01
+  @version 0x00
+
+  def encode_context(%{trace_id: tid, span_id: sid, sampled: sampled}) do
+    flags = if sampled, do: @sampled_flag, else: 0x00
+    <<@version, tid::128, sid::64, flags::8>>
+  end
+
+  # Fast decode: chỉ đọc sampled bit — không deserialize toàn bộ
+  def is_sampled?(<<@version, _::128, _::64, flags::8>>) do
+    (flags &&& @sampled_flag) != 0
+  end
+
+  def is_sampled?(_), do: false
+
+  # Full decode: chỉ khi cần (sampled path)
+  def decode_context(<<@version, trace_id::128, span_id::64, flags::8>>) do
+    %Discord.Transport.Envelope{
+      trace_id: trace_id,
+      span_id:  span_id,
+      sampled:  (flags &&& @sampled_flag) != 0,
+    }
+  end
+
+  # Usage tại hot path:
+  def handle_incoming_grpc(request, raw_trace_context) do
+    if is_sampled?(raw_trace_context) do
+      # Chỉ decode khi sampled (~1% requests)
+      ctx = decode_context(raw_trace_context)
+      handle_with_trace(request, ctx)
+    else
+      # 99% requests: skip decode hoàn toàn
+      handle_without_trace(request)
+    end
+    # Before: 75% thời gian spent decoding context cho mọi request
+    # After: decode chỉ 1% → 74% time saved
+  end
+end
+```
+
+---
+
+## Trace flow qua toàn bộ Discord stack
+
+```elixir
+defmodule Discord.Tracing.FullFlow do
+  @moduledoc """
+  End-to-end trace của 1 message qua Discord infrastructure.
+  Chỉ với 0.001% sampling rate cho large guilds.
+  """
+
+  def trace_message_flow do
+    # t=0: Client gửi message qua WebSocket
+    # Phoenix Channel tạo root span
+    root_span = Tracer.start_span("ws.message_received", [
+      sampled: upstream_sampling_decision(),
+    ])
+
+    # Nếu sampled (0.01% of messages from large guilds):
+    trace_env = %Envelope{
+      trace_id: root_span.trace_id,
+      span_id:  root_span.id,
+      sampled:  root_span.sampled,
+    }
+
+    # Transport.send tới Guild process
+    # Guild nhận → tạo span "guild.message_received"
+    Transport.send(guild_pid, {:new_message, message})
+
+    # Guild fanout tới 1,000,000 sessions
+    # DynamicSampler: rate = 0.00001 (0.001%)
+    # → ~10 sessions sẽ được sampled
+    # → 999,990 sessions: zero overhead
+
+    # 10 sampled sessions tạo span "session.message_delivered"
+
+    # Kết quả trace:
+    # root_span (ws.message_received)
+    #   └─ guild_span (guild.message_received, fanout=1M)
+    #        ├─ session_span_1 (session.message_delivered, user=A)
+    #        ├─ session_span_2 (session.message_delivered, user=B)
+    #        └─ ... (10 total)
+
+    # Useful: trace cho thấy end-to-end latency
+    # Lightweight: chỉ 12 spans thay vì 1,000,002 spans
+  end
+end
+```
+
+---
+
+## Incident discovery — giá trị thực của distributed tracing
+
+Traces cho thấy members gặp 16-phút delays khi kết nối tới guild process bị ảnh hưởng — user impact có thể quantify được mà metrics và logs không thể reveal. Traces cũng expose downstream cascade: users không thể click vào guild trong suốt outage.
+
+```elixir
+defmodule Discord.Tracing.IncidentAnalysis do
+  @moduledoc """
+  Real incident Discord discovered via traces.
+  Guild process không theo kịp activity → 16-phút delays.
+  """
+
+  # Trace data của incident:
+  # root_span: ws.message_received, duration=14ms (bình thường)
+  #   └─ guild.message_received: duration=960,000ms  ← 16 phút!
+  #        sampled sessions: duration=960,015ms       ← tương tự
+
+  # Trước distributed tracing:
+  # Metric: "guild CPU = 95%" → không biết impact tới users
+  # Log: "guild process slow" → không biết bao lâu users chờ
+
+  # Sau distributed tracing:
+  # Trace: "user A waited 16 phút to receive message" → clear impact
+  # Alert trigger: span duration > 5000ms cho guild.message_received
+
+  def setup_trace_based_alerts do
+    # Alert khi span duration quá cao
+    # Liên kết trực tiếp với user experience
+    Prometheus.histogram_observe(
+      :guild_message_fanout_duration_ms,
+      %{guild_id: guild_id},
+      span.duration_ms
+    )
+
+    # SLO alert: p99 > 1000ms → SLA breach
+    # Trace data → biết chính xác guild nào, user nào bị ảnh hưởng
+  end
+end
+```
+
+---
+
+## Kết hợp tracing với existing telemetry
+
+```elixir
+defmodule Discord.Tracing.TelemetryBridge do
+  @moduledoc """
+  Bridge giữa :telemetry events (Prometheus) và
+  distributed traces (Jaeger/Honeycomb).
+
+  Không replace nhau — complement nhau:
+  - Metrics: what's happening at aggregate level
+  - Traces:  why a specific request is slow
+  """
+
+  def setup_bridge do
+    # Attach tới telemetry events
+    :telemetry.attach_many(
+      "discord-trace-bridge",
+      [
+        [:discord, :guild, :fanout, :stop],
+        [:discord, :session, :delivery, :stop],
+        [:discord, :rust, :nif, :duration],
+      ],
+      &handle_telemetry_event/4,
+      nil
+    )
+  end
+
+  def handle_telemetry_event(
+    [:discord, :guild, :fanout, :stop],
+    measurements,
+    metadata,
+    _config
+  ) do
+    # Nếu đang trong sampled trace → tạo span
+    case Discord.Transport.get_current_trace() do
+      %{sampled: true} = trace_env ->
+        span = Tracer.start_span("guild.fanout",
+          parent: trace_env,
+          start_time: measurements.start_time
+        )
+
+        Tracer.finish_span(span, %{
+          duration_ms:      measurements.duration / 1_000_000,
+          recipient_count:  metadata.recipient_count,
+          guild_id:         metadata.guild_id,
+        })
+
+      _ ->
+        # Không sampled → chỉ update Prometheus counter
+        # (Prometheus metrics luôn được collect, không sample)
+        :ok
+    end
+  end
+end
+```
+
+---
+
+## CPU impact — before và after optimizations
+
+```
+Optimization timeline (Discord production data):
+
+Initial deployment (no optimization):
+  Guild CPU:   65% (+20% from baseline 45%)
+  Session CPU: 55% (+10% from baseline 45%)
+  Cause: serialize/deserialize context even when not sampled
+
+After "sessions don't start new traces":
+  Guild CPU:   48% (+3% from baseline)
+  Session CPU: 45% (baseline, fully recovered)
+  Cause: sessions skip trace creation → 10M fewer span operations/s
+
+After "fast-path sampling check":
+  Guild CPU:   46% (+1% from baseline)
+  gRPC CPU:    reduced 74% for unsampled requests
+  Cause: bit check instead of full protobuf decode
+
+After "shrink unsampled envelope":
+  Guild CPU:   45.5% (~baseline)
+  Network:     3% reduction (smaller envelopes)
+  Cause: strip baggage from unsampled messages
+
+Final state:
+  Tracing overhead: ~0.5% CPU
+  Trace coverage:   meaningful (catches real incidents)
+  Span volume:      within budget (10k spans/s)
+```
+
+---
+
+## Tóm tắt — design principles cho actor model tracing
+
+```
+Standard distributed tracing assumption:
+  1 request = 1 trace = linear chain
+  → Works for HTTP microservices
+
+Actor model reality:
+  1 event = 1 trace = exponential fan
+  → Needs fundamentally different approach
+
+Discord's solutions:
+  1. Wrap message passing (Transport library)
+     Không modify process state → clean abstraction
+
+  2. Dynamic sampling based on fanout
+     Sample rate ∝ 1/fanout_size
+     Maintain: constant span budget regardless of guild size
+
+  3. Sampling propagation, not sampling decision per hop
+     Upstream decides → downstream inherit
+     Sessions cannot independently trigger sampling
+
+  4. Fast-path for unsampled context
+     Check 1 bit → skip entire decode
+     74% reduction in context processing overhead
+
+  5. Shrink envelope for unsampled
+     Strip baggage → smaller messages → less network + GC
+
+Result:
+  Before: tracing made large guilds unusable
+  After:  tracing overhead < 1% CPU
+          Meaningful traces cho debugging
+          SLO-linked alerts với user impact data
+```
+
+---
