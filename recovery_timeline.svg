@@ -1,0 +1,83 @@
+<svg width="100%" viewBox="0 0 680 580" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>Node failure recovery timeline</title>
+<style>
+  text { font-family: sans-serif; }
+  .th { font-size: 14px; font-weight: 500; fill: #3d3d3a; }
+  .ts { font-size: 12px; fill: #73726c; }
+  .label { font-size: 12px; fill: #E24B4A; }
+  .ok { font-size: 12px; fill: #1D9E75; }
+</style>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="#888" stroke-width="1.5"/>
+  </marker>
+</defs>
+<line x1="90" y1="30" x2="90" y2="550" stroke="#ccc" stroke-width="1.5"/>
+
+<!-- t=0 -->
+<circle cx="90" cy="50" r="7" fill="#FCEBEB" stroke="#E24B4A" stroke-width="1.5"/>
+<text class="label" x="78" y="54" text-anchor="end">t=0ms</text>
+<rect x="106" y="36" width="556" height="36" rx="6" fill="#FCEBEB" stroke="#E24B4A" stroke-width="0.5"/>
+<text class="th" x="384" y="53" text-anchor="middle" fill="#A32D2D">Node A KILLED — hardware failure / OOM / kill -9</text>
+<text class="ts" x="384" y="66" text-anchor="middle">TCP connections drop · epmd unreachable · OS process gone</text>
+
+<!-- t=1-2s -->
+<circle cx="90" cy="108" r="7" fill="#FAEEDA" stroke="#BA7517" stroke-width="1.5"/>
+<text class="ts" x="78" y="112" text-anchor="end">t=1-2s</text>
+<rect x="106" y="94" width="556" height="40" rx="6" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
+<text class="th" x="384" y="110" text-anchor="middle" fill="#633806">BEAM Distribution: TCP keepalive timeout → nodedown</text>
+<text class="ts" x="384" y="126" text-anchor="middle">net_kernel broadcast {:nodedown, nodeA} → tất cả monitors</text>
+
+<!-- t=2s -->
+<circle cx="90" cy="166" r="7" fill="#E6F1FB" stroke="#185FA5" stroke-width="1.5"/>
+<text class="ts" x="78" y="170" text-anchor="end">t=2s</text>
+<rect x="106" y="152" width="556" height="40" rx="6" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<text class="th" x="384" y="168" text-anchor="middle" fill="#0C447C">ZenMonitor.Local: lookup ETS → 500 guild PIDs trên nodeA</text>
+<text class="ts" x="384" y="184" text-anchor="middle">Generate {:zen_down, guild_pid, :noconnection} × 500</text>
+
+<!-- t=2-3s -->
+<circle cx="90" cy="224" r="7" fill="#E6F1FB" stroke="#185FA5" stroke-width="1.5"/>
+<text class="ts" x="78" y="228" text-anchor="end">t=2-3s</text>
+<rect x="106" y="210" width="556" height="40" rx="6" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<text class="th" x="384" y="226" text-anchor="middle" fill="#0C447C">ZenMonitor fan-out → 500,000 sessions (controlled, local)</text>
+<text class="ts" x="384" y="242" text-anchor="middle">Batched · rate-limited · không qua network</text>
+
+<!-- t=3s -->
+<circle cx="90" cy="282" r="7" fill="#FAEEDA" stroke="#BA7517" stroke-width="1.5"/>
+<text class="ts" x="78" y="286" text-anchor="end">t=3s</text>
+<rect x="106" y="268" width="556" height="40" rx="6" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
+<text class="th" x="384" y="284" text-anchor="middle" fill="#633806">Horde.DynamicSupervisor restart 500 guild processes</text>
+<text class="ts" x="384" y="300" text-anchor="middle">Consistent hash → chọn target node · start_child trên B, C, D, E</text>
+
+<!-- t=3-15s -->
+<circle cx="90" cy="340" r="7" fill="#E1F5EE" stroke="#0F6E56" stroke-width="1.5"/>
+<text class="ts" x="78" y="344" text-anchor="end">t=3-15s</text>
+<rect x="106" y="326" width="556" height="52" rx="6" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text class="th" x="384" y="342" text-anchor="middle" fill="#085041">Guild processes khởi động trên nodes mới</text>
+<text class="ts" x="384" y="358" text-anchor="middle">Load metadata từ DB · rebuild ETS từ ScyllaDB</text>
+<text class="ts" x="384" y="372" text-anchor="middle">Register Horde.Registry · spawn relay processes · mark ready</text>
+
+<!-- t=6-36s -->
+<circle cx="90" cy="414" r="7" fill="#EAF3DE" stroke="#3B6D11" stroke-width="1.5"/>
+<text class="ts" x="78" y="418" text-anchor="end">t=6-36s</text>
+<rect x="106" y="400" width="556" height="52" rx="6" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+<text class="th" x="384" y="416" text-anchor="middle" fill="#27500A">Sessions reconnect với jitter — spread đều 30 giây</text>
+<text class="ts" x="384" y="432" text-anchor="middle">delay = 1000 + phash2(guild_id, user_id) ms · tránh stampede</text>
+<text class="ts" x="384" y="446" text-anchor="middle">Horde lookup → new guild PID → ZenMonitor.monitor → state sync</text>
+
+<!-- t=40s -->
+<circle cx="90" cy="490" r="8" fill="#EAF3DE" stroke="#3B6D11" stroke-width="2"/>
+<text class="ok" x="78" y="494" text-anchor="end">t=40s</text>
+<rect x="106" y="476" width="556" height="40" rx="6" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+<text class="th" x="384" y="492" text-anchor="middle" fill="#27500A">Fully recovered ✅ — 100% sessions online · guilds serving</text>
+<text class="ts" x="384" y="508" text-anchor="middle">Users thấy: lag spike t=2-6s → normal sau đó</text>
+
+<!-- connector dashes -->
+<line x1="90" y1="57" x2="90" y2="101" stroke="#ccc" stroke-width="1" stroke-dasharray="3 2"/>
+<line x1="90" y1="115" x2="90" y2="159" stroke="#ccc" stroke-width="1" stroke-dasharray="3 2"/>
+<line x1="90" y1="173" x2="90" y2="217" stroke="#ccc" stroke-width="1" stroke-dasharray="3 2"/>
+<line x1="90" y1="231" x2="90" y2="275" stroke="#ccc" stroke-width="1" stroke-dasharray="3 2"/>
+<line x1="90" y1="289" x2="90" y2="333" stroke="#ccc" stroke-width="1" stroke-dasharray="3 2"/>
+<line x1="90" y1="347" x2="90" y2="407" stroke="#ccc" stroke-width="1" stroke-dasharray="3 2"/>
+<line x1="90" y1="421" x2="90" y2="483" stroke="#ccc" stroke-width="1" stroke-dasharray="3 2"/>
+</svg>
