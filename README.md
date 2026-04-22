@@ -4630,3 +4630,563 @@ Applicable pattern:
 
 ---
 
+# Q9: Node Failure Recovery — 40 Giây Gồm Những Bước Gì
+
+*Breakdown chi tiết từng millisecond của quá trình recovery*
+
+---
+
+## Setup — hiểu topology trước khi vào timeline
+
+```
+Discord cluster (simplified):
+
+Node A (discord@10.0.1.1) — WILL FAIL
+  ├── Guild processes: G1, G2, G3 ... G500
+  ├── Session processes: 200,000 users
+  └── ZenMonitor.Proxy
+
+Node B (discord@10.0.1.2)
+  ├── Guild processes: G501 ... G1000
+  ├── Session processes: 200,000 users
+  └── ZenMonitor.Local (monitoring G1-G500 on Node A)
+
+Node C (discord@10.0.1.3)
+  ├── Guild processes: G1001 ... G1500
+  ├── Session processes: 200,000 users
+  └── ZenMonitor.Local (monitoring G1-G500 on Node A)
+
+Node D, E: tương tự Node B, C
+
+Relationships:
+  500,000 sessions trên B,C,D,E đang monitor guilds trên A
+  (vì users trong guild G1-G500 connect khắp cluster)
+```
+
+---
+
+## Timeline đầy đủ — 40 giây breakdown---
+
+## Phase 1: t=0 → t=2s — Detection
+
+### Tại sao mất 1-2 giây để detect?
+
+```elixir
+defmodule Discord.NodeDetection do
+  @moduledoc """
+  BEAM dùng TCP keepalive để detect node failure.
+  Không phải heartbeat riêng — dùng OS-level TCP.
+  """
+
+  # Erlang distribution TCP keepalive defaults:
+  # net_ticktime = 60 giây (mặc định)
+  # → Node bị coi là down sau 60 giây không respond
+  # → QUÁ CHẬM cho Discord
+
+  # Discord config:
+  def configure_fast_detection do
+    # Giảm net_ticktime xuống 5 giây
+    # BEAM sẽ gửi tick mỗi 5/4 = 1.25 giây
+    # Timeout sau 4 ticks missed = 5 giây
+    :net_kernel.set_net_ticktime(5)
+
+    # Kết hợp với TCP keepalive ở OS level:
+    # SO_KEEPALIVE = true
+    # TCP_KEEPIDLE = 5s   (bắt đầu probe sau 5s idle)
+    # TCP_KEEPINTVL = 1s  (probe interval)
+    # TCP_KEEPCNT = 3     (3 probes failed = connection dead)
+    # → Detect trong ~8 giây worst case
+
+    # Với Fly.io / Kubernetes: thường detect trong 1-2 giây
+    # vì network layer signal nodedown nhanh hơn TCP timeout
+  end
+
+  # Khi nodedown detected:
+  def handle_nodedown(node) do
+    # BEAM gửi {:nodedown, node} tới:
+    # 1. Tất cả processes đã gọi :net_kernel.monitor_nodes(true)
+    # 2. ZenMonitor.Local (đã subscribe)
+    # 3. libcluster EventHandler
+    # 4. Discord.Cluster.EventHandler
+    :ok
+  end
+end
+```
+
+---
+
+## Phase 2: t=2s → t=3s — ZenMonitor Processing
+
+```elixir
+defmodule ZenMonitor.Local do
+  # Nhận nodedown → process tất cả monitors cho node đó
+  def handle_info({:nodedown, dead_node}, state) do
+    start = System.monotonic_time(:millisecond)
+
+    # Lấy tất cả targets trên dead node từ ETS
+    # O(unique_guild_count) — không phải O(session_count)
+    dead_targets = :ets.select(state.monitors_table, [
+      {{:"$1", %{target_node: dead_node}},
+       [],
+       [:"$1"]}
+    ])
+    # dead_targets = [guild_pid_1, guild_pid_2, ... guild_pid_500]
+    # Chỉ 500 entries — không phải 500,000
+
+    # Fan out tới local processes
+    # Batched để tránh spike scheduler
+    dead_targets
+    |> Enum.chunk_every(100)   # batch 100 targets
+    |> Enum.each(fn batch ->
+      Enum.each(batch, fn target_pid ->
+        notify_local_monitors(target_pid, :noconnection, state)
+      end)
+      # Yield scheduler sau mỗi batch
+      # Tránh monopolize scheduler quá lâu
+      Process.sleep(0)  # :erlang.yield() equivalent
+    end)
+
+    elapsed = System.monotonic_time(:millisecond) - start
+    :telemetry.execute(
+      [:discord, :zenmonitor, :nodedown_processed],
+      %{duration: elapsed, targets: length(dead_targets)},
+      %{node: dead_node}
+    )
+
+    {:noreply, state}
+  end
+
+  defp notify_local_monitors(target_pid, reason, state) do
+    # Lookup tất cả local callers đang monitor target này
+    local_refs = :ets.lookup(state.targets_table, target_pid)
+
+    Enum.each(local_refs, fn {_target, ref} ->
+      case :ets.lookup(state.monitors_table, ref) do
+        [{^ref, %{caller: caller_pid}}] ->
+          send(caller_pid, {
+            :DOWN, ref, :process, target_pid,
+            {:zen_monitor, reason}
+          })
+          :ets.delete(state.monitors_table, ref)
+        [] -> :ok
+      end
+    end)
+
+    :ets.match_delete(state.targets_table, {target_pid, :_})
+  end
+end
+```
+
+---
+
+## Phase 3: t=3s — Horde Supervisor restart guilds
+
+```elixir
+defmodule Discord.Guild.HordeSupervisor do
+  # Horde detect member down qua :nodedown event
+  # Tự động restart processes của dead node
+
+  def handle_info({:nodedown, dead_node}, state) do
+    # Horde internal: find tất cả processes owned by dead_node
+    orphaned = Horde.Registry.select(
+      Discord.Guild.HordeRegistry,
+      [{{:"$1", :"$2", :"$3"}, [{:==, {:node, :"$2"}, dead_node}], [:"$1"]}]
+    )
+    # orphaned = [guild_id_1, guild_id_2, ... guild_id_500]
+
+    # Redistribute theo consistent hash ring
+    Enum.each(orphaned, fn guild_id ->
+      target_node = Discord.Router.node_for_guild(guild_id)
+
+      # Start process trên target node
+      # Horde tự handle nếu process đã exist (idempotent)
+      Horde.DynamicSupervisor.start_child(
+        __MODULE__,
+        {Discord.Guild.Process, guild_id: guild_id},
+        target_node: target_node
+      )
+    end)
+
+    {:noreply, state}
+  end
+end
+```
+
+---
+
+## Phase 4: t=3s → t=15s — Guild process initialization
+
+Đây là phase chậm nhất — load state từ persistent storage:
+
+```elixir
+defmodule Discord.Guild.Process do
+  def init(guild_id) do
+    start = System.monotonic_time(:millisecond)
+
+    # Bước 1: Load guild metadata từ cache/DB (~50ms)
+    metadata = load_guild_metadata(guild_id)
+
+    # Bước 2: Load members vào ETS (~5-12 giây tùy guild size)
+    # Đây là bottleneck chính của recovery time
+    table = :ets.new(:"guild_members_#{guild_id}", [:set, :public])
+    member_count = load_members_into_ets(guild_id, table)
+
+    # Bước 3: Load voice states (~10ms)
+    voice_states = load_voice_states(guild_id)
+
+    elapsed = System.monotonic_time(:millisecond) - start
+
+    :telemetry.execute(
+      [:discord, :guild, :cold_start],
+      %{duration: elapsed, member_count: member_count},
+      %{guild_id: guild_id}
+    )
+
+    state = %__MODULE__{
+      guild_id:    guild_id,
+      ets_table:   table,
+      voice_states: voice_states,
+    }
+
+    # Notify supervisor: guild ready để nhận sessions
+    send(self(), :register_as_ready)
+
+    {:ok, state}
+  end
+
+  defp load_members_into_ets(guild_id, table) do
+    # Stream từ ScyllaDB — không load toàn bộ vào memory
+    # (tránh OOM khi guild có 1M+ members)
+    Discord.DB.stream_guild_members(guild_id)
+    |> Stream.chunk_every(1_000)
+    |> Stream.each(fn chunk ->
+      # Batch insert vào ETS
+      :ets.insert(table, chunk)
+    end)
+    |> Stream.run()
+
+    :ets.info(table, :size)
+  end
+
+  # Guild ready: register trong Horde.Registry
+  def handle_info(:register_as_ready, state) do
+    # Đăng ký trong distributed registry
+    # Sau bước này: sessions có thể lookup và connect
+    Horde.Registry.register(
+      Discord.Guild.HordeRegistry,
+      state.guild_id,
+      %{node: Node.self(), ready_at: DateTime.utc_now()}
+    )
+
+    {:noreply, %{state | status: :ready}}
+  end
+end
+```
+
+### Tại sao load members mất 3-12 giây?
+
+```
+Guild với 1,000,000 members:
+  ScyllaDB read throughput: ~100,000 rows/giây
+  1,000,000 rows / 100,000 = ~10 giây
+
+Optimization Discord dùng:
+  1. Parallel reads từ nhiều ScyllaDB nodes
+  2. Pre-warm cache (Midjourney guild luôn hot trong Redis)
+  3. Snapshot-based recovery: lưu ETS snapshot định kỳ
+     → Load từ snapshot (~2 giây) thay vì DB (~10 giây)
+```
+
+---
+
+## Phase 5: t=6s → t=36s — Jittered reconnect
+
+```elixir
+defmodule Discord.Session.Process do
+  # Nhận DOWN từ ZenMonitor
+  def handle_info(
+    {:DOWN, ref, :process, _guild_pid, {:zen_monitor, _reason}},
+    state
+  ) do
+    guild_id = Map.get(state.guild_monitors, ref)
+
+    # Tính jitter delay
+    delay = reconnect_jitter(guild_id, state.user_id)
+
+    Process.send_after(
+      self(),
+      {:attempt_guild_reconnect, guild_id, 0},
+      delay
+    )
+
+    {:noreply, %{state |
+      guild_monitors: Map.delete(state.guild_monitors, ref)
+    }}
+  end
+
+  defp reconnect_jitter(guild_id, user_id) do
+    # Deterministic jitter: cùng user → cùng delay
+    # Phân phối đều từ 1s đến 30s
+    base     = 1_000
+    variance = 29_000
+    :erlang.phash2({guild_id, user_id}, variance) + base
+  end
+
+  # Attempt reconnect — với retry logic
+  def handle_info(
+    {:attempt_guild_reconnect, guild_id, attempt},
+    state
+  ) when attempt < 10 do
+    case Horde.Registry.lookup(Discord.Guild.HordeRegistry, guild_id) do
+      [{guild_pid, %{status: :ready}}] ->
+        # Guild đã ready → kết nối
+        do_guild_reconnect(guild_id, guild_pid, state)
+
+      [{_pid, %{status: :initializing}}] ->
+        # Guild đang load → đợi thêm
+        retry_delay = :math.pow(2, attempt) * 500 |> round()
+        Process.send_after(
+          self(),
+          {:attempt_guild_reconnect, guild_id, attempt + 1},
+          retry_delay
+        )
+        {:noreply, state}
+
+      [] ->
+        # Guild chưa start → đợi
+        Process.send_after(
+          self(),
+          {:attempt_guild_reconnect, guild_id, attempt + 1},
+          2_000
+        )
+        {:noreply, state}
+    end
+  end
+
+  defp do_guild_reconnect(guild_id, guild_pid, state) do
+    # Monitor guild mới
+    ref = ZenMonitor.monitor(guild_pid)
+
+    # Gửi reconnect request với last_seen_sequence
+    # Guild sẽ gửi lại messages đã miss
+    last_seq = Map.get(state.last_sequences, guild_id, 0)
+
+    GenServer.cast(guild_pid, {
+      :session_reconnect,
+      state.user_id,
+      self(),
+      %{last_sequence: last_seq}
+    })
+
+    new_state = %{state |
+      guild_monitors:  Map.put(state.guild_monitors, ref, guild_id),
+      guild_pids:      Map.put(state.guild_pids, guild_id, guild_pid),
+    }
+
+    {:noreply, new_state}
+  end
+end
+```
+
+---
+
+## Guild xử lý reconnect — gửi missed messages
+
+```elixir
+defmodule Discord.Guild.Process do
+  def handle_cast(
+    {:session_reconnect, user_id, session_pid, %{last_sequence: last_seq}},
+    state
+  ) do
+    # Tìm messages user đã miss trong khi guild down
+    missed = get_messages_since_sequence(state, last_seq)
+
+    # Gửi state sync cho session
+    send(session_pid, {
+      :guild_state_sync,
+      %{
+        # Messages đã miss (từ message cache trong memory)
+        missed_messages: missed,
+        # Presence snapshot hiện tại
+        presences: build_presence_snapshot(state),
+        # Voice states
+        voice_states: state.voice_states,
+        # Sequence number hiện tại để session sync
+        current_sequence: state.message_sequence,
+      }
+    })
+
+    # Thêm session vào relay
+    assign_to_relay(user_id, session_pid, state)
+
+    {:noreply, state}
+  end
+
+  defp get_messages_since_sequence(state, last_seq) do
+    # Message cache giữ 50 messages gần nhất trong memory
+    # Nếu user miss nhiều hơn 50 → client sẽ fetch từ DB
+    state.message_cache
+    |> Enum.filter(fn msg -> msg.sequence > last_seq end)
+    |> Enum.sort_by(& &1.sequence)
+  end
+end
+```
+
+---
+
+## Monitoring recovery — Prometheus metrics
+
+```elixir
+defmodule Discord.Recovery.Metrics do
+  @doc """
+  Metrics Discord track trong quá trình recovery
+  để alert nếu recovery chậm hơn expected
+  """
+
+  def setup_recovery_tracking(dead_node, guild_count) do
+    # Track từng phase
+    start_times = %{
+      detection:   nil,
+      zen_done:    nil,
+      horde_done:  nil,
+      guilds_ready: nil,
+      sessions_done: nil,
+    }
+
+    # SLO targets:
+    # Detection:          < 3 giây
+    # ZenMonitor fan-out: < 1 giây sau detection
+    # Guild restart:      < 5 giây sau detection
+    # Guild ready:        < 15 giây sau detection
+    # Full recovery:      < 45 giây sau detection
+
+    :telemetry.execute(
+      [:discord, :recovery, :started],
+      %{guild_count: guild_count},
+      %{dead_node: dead_node}
+    )
+  end
+
+  # Alert nếu recovery quá chậm
+  def check_recovery_progress(phase, elapsed_ms) do
+    slo = %{
+      detection:    3_000,
+      zen_done:     4_000,
+      horde_done:   6_000,
+      guilds_ready: 18_000,
+      full_recovery: 45_000,
+    }
+
+    if elapsed_ms > Map.get(slo, phase, 0) do
+      :telemetry.execute(
+        [:discord, :recovery, :slo_breach],
+        %{elapsed: elapsed_ms, slo: slo[phase]},
+        %{phase: phase}
+      )
+      # Trigger PagerDuty alert
+    end
+  end
+end
+```
+
+---
+
+## Edge cases — khi recovery không đi theo happy path
+
+```elixir
+defmodule Discord.Recovery.EdgeCases do
+
+  # CASE 1: Node A restart ngay sau khi die
+  # (crash loop — OOM killer)
+  # → Node A join lại cluster sau 5 giây
+  # → Guilds đã moved sang B, C, D, E
+  # → Hash ring: guild_id vẫn map về Node B (đã updated)
+  # → Node A join: không có guilds → just another worker node
+  # Không có conflict vì hash ring là source of truth
+
+  # CASE 2: 2 nodes die cùng lúc (network partition)
+  # → Cluster bị split thành 2 parts
+  # → Mỗi part nghĩ mình là "the cluster"
+  # → Split brain: 2 copies của cùng guild process
+  # → Discord dùng Horde với distributed consensus
+  #    để detect và resolve conflict
+
+  def handle_split_brain(guild_id) do
+    # Horde detect: 2 processes cùng guild_id trong registry
+    # Resolution: process nào được registered sau thì win
+    # (Horde dùng CRDT-based conflict resolution)
+
+    # Loser process nhận :kill message từ Horde
+    # Winner process tiếp tục serve
+
+    # State merge: winner apply events từ loser's buffer
+    # (eventual consistency trong ~100ms sau partition heal)
+    :ok
+  end
+
+  # CASE 3: Guild DB chậm khi load members
+  # Guild process init timeout (default 5 giây trong GenServer)
+  # → Process crash trước khi load xong
+  # → Supervisor retry → crash lại
+  # → Retry loop
+
+  def handle_slow_db_init(guild_id) do
+    # Giải pháp: async init pattern
+    # Guild start nhanh với empty state
+    # Load data async trong background
+    # Mark as :loading, từ chối sessions cho đến khi :ready
+
+    # Sessions nhận {:guild_loading, estimated_ready_at}
+    # Client hiện loading spinner thay vì error
+    :ok
+  end
+
+  # CASE 4: Sessions reconnect nhanh hơn guild ready
+  # (jitter 1 giây, guild cần 10 giây để load)
+  # → Session lookup Horde.Registry → không tìm thấy
+  # → Retry với exponential backoff
+  # → Guild ready sau 10 giây → session reconnect thành công
+
+  def handle_session_before_guild(guild_id, session_pid) do
+    # Subscribe vào "guild_ready" event
+    Phoenix.PubSub.subscribe(
+      Discord.PubSub,
+      "guild_ready:#{guild_id}"
+    )
+
+    # Khi guild ready: broadcast event này
+    # Session nhận → reconnect ngay không cần wait timer
+    :ok
+  end
+end
+```
+
+---
+
+## Tổng kết — tại sao 40 giây là achievable
+
+```
+Phase           Duration    Bottleneck            Optimization
+────────────────────────────────────────────────────────────────
+Detection       1-2s        TCP keepalive         net_ticktime=5s
+ZenMonitor      <1s         ETS lookup × 500      Off-heap, O(guilds)
+Horde restart   <1s         process spawn         DynamicSupervisor
+Guild init      3-15s       DB read 1M members    ScyllaDB stream
+                            (đây là bottleneck)   + ETS snapshot cache
+Jitter spread   30s         intentional           phash2 distribution
+────────────────────────────────────────────────────────────────
+Total           ~40s        guild init dominant   cache warm guilds
+
+Key: 40 giây = guild init time + max jitter
+     Không phải 15 phút như trước ZenMonitor
+     Không phải infinity như trước Horde
+
+User experience:
+  t=0-6s:   Message lag, presence freeze
+  t=6-36s:  Guild reconnecting (spinner) — staggered
+  t=40s:    100% normal
+  Total perceived downtime per user: ~6 giây average
+```
+
+---
+
