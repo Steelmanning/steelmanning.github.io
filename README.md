@@ -7024,3 +7024,567 @@ Key mental model:
 
 ---
 
+# Q13: @everyone Ping — Permission Check cho 1 Triệu Users
+
+*Bài toán "simple feature, hard implementation" điển hình nhất của Discord*
+
+---
+
+## Tại sao @everyone là bài toán riêng biệt
+
+```
+Bình thường khi có message mới:
+  Guild biết ai có thể xem channel → đã cache trong relay
+  Fanout: gửi tới pids đã filtered sẵn
+  Cost: O(active_members_in_relay)
+
+Khi có @everyone ping:
+  Phải kiểm tra từng member trong guild:
+    1. Member có thể xem channel này không?
+       (channel permission overwrites)
+    2. Member có bị mute không?
+    3. Member có role @everyone suppressed không?
+    4. Member có suppress @everyone trong user settings không?
+  Cost: O(ALL_members) — không phải O(active)
+  Với Midjourney: O(1,000,000)
+```
+
+```elixir
+# Naive approach — thảm họa
+defmodule Discord.Guild.Process do
+  def handle_cast({:everyone_ping, channel_id, message}, state) do
+    # Lặp qua TẤT CẢ members
+    # 1,000,000 iterations × permission_check = vài giây
+    eligible = state.members  # 1,000,000 entries trong process heap!
+      |> Enum.filter(fn {user_id, member} ->
+        can_see_channel?(member, channel_id) and
+        not suppressed_everyone?(member) and
+        not muted_in_channel?(member, channel_id)
+      end)
+      |> Enum.map(fn {user_id, _} -> user_id end)
+
+    # Guild bị BLOCK toàn bộ thời gian này
+    # Không xử lý được messages khác
+    # Users thấy guild "frozen" vài giây
+
+    notify_eligible_users(eligible, message, state)
+    {:noreply, state}
+  end
+end
+```
+
+---
+
+## Tại sao @everyone khó hơn fanout bình thường
+
+```elixir
+defmodule Discord.Permission.Complexity do
+  @moduledoc """
+  Permission check cho @everyone không đơn giản là 1 bit check.
+  Là cả một computation tree.
+  """
+
+  def can_receive_everyone_ping?(member, channel, guild) do
+    # Layer 1: Guild-level base permissions
+    base_perms = compute_base_permissions(member.roles, guild.roles)
+
+    # Layer 2: Channel permission overwrites
+    # Mỗi channel có thể override guild permissions
+    # Mỗi role có thể có overwrite khác nhau
+    channel_perms = apply_channel_overwrites(
+      base_perms,
+      member.roles,
+      channel.permission_overwrites
+    )
+
+    # Layer 3: Check specific permission
+    # VIEW_CHANNEL + MENTION_EVERYONE (or admin)
+    can_view    = has_permission?(channel_perms, :view_channel)
+    can_mention = has_permission?(channel_perms, :mention_everyone) or
+                  has_permission?(channel_perms, :administrator)
+
+    # Layer 4: Member-specific suppressions
+    not_suppressed = not member_suppressed_everyone?(member)
+    not_muted      = not member_muted_in_channel?(member, channel.id)
+
+    # Layer 5: User notification preferences
+    # (stored separately — không trong guild state)
+    notif_allowed = user_allows_everyone_notification?(member.user_id)
+
+    can_view and can_mention and not_suppressed and
+    not_muted and notif_allowed
+  end
+
+  defp compute_base_permissions(member_roles, guild_roles) do
+    # Admin check: if admin role → all permissions
+    if has_admin_role?(member_roles, guild_roles) do
+      :all_permissions
+    else
+      # Accumulate permissions from all roles
+      Enum.reduce(member_roles, 0, fn role_id, acc ->
+        role = Map.get(guild_roles, role_id)
+        acc ||| role.permissions  # bitwise OR
+      end)
+    end
+  end
+
+  defp apply_channel_overwrites(base_perms, member_roles, overwrites) do
+    # Apply role overwrites first (lower priority)
+    perms_after_roles = Enum.reduce(member_roles, base_perms, fn role_id, acc ->
+      case Map.get(overwrites, {:role, role_id}) do
+        nil -> acc
+        %{allow: allow, deny: deny} ->
+          (acc ||| allow) &&& ~~~deny  # apply allow/deny bits
+      end
+    end)
+
+    # Apply member-specific overwrite (highest priority)
+    case Map.get(overwrites, {:member, member_roles}) do
+      nil -> perms_after_roles
+      %{allow: allow, deny: deny} ->
+        (perms_after_roles ||| allow) &&& ~~~deny
+    end
+  end
+end
+```
+
+---
+
+## ETS Worker Pattern — giải pháp Discord
+
+Một trong những kẻ phạm tội lớn nhất về unresponsiveness là các operations cần chạy trong guild và iterate qua tất cả members. Những operations này tương đối hiếm nhưng có xảy ra. Discord giải quyết bằng ETS: store members trong ETS, spawn worker processes để chạy async dùng shared ETS data, giải phóng guild để tiếp tục xử lý messages.
+
+```elixir
+defmodule Discord.Guild.EveryonePing do
+  @moduledoc """
+  @everyone ping handler — worker process pattern.
+
+  Key insight: guild process KHÔNG làm permission check.
+  Worker process đọc ETS trực tiếp và làm check độc lập.
+  Guild tiếp tục serve traffic trong khi worker chạy.
+  """
+
+  # Guild process nhận @everyone ping
+  def handle_cast({:everyone_ping, channel_id, message}, state) do
+    # Spawn worker — non-blocking
+    # Worker sẽ làm heavy lifting
+    spawn_everyone_worker(
+      state.ets_table,
+      state.guild_id,
+      channel_id,
+      message,
+      state.channels,
+      state.roles
+    )
+
+    # Guild tiếp tục ngay lập tức
+    # Không chờ worker xong
+    {:noreply, state}
+  end
+
+  defp spawn_everyone_worker(table, guild_id, channel_id,
+                              message, channels, roles) do
+    # Task.start: spawn process, không link với guild
+    # Nếu worker crash → guild không bị ảnh hưởng
+    Task.start(fn ->
+      channel = Map.get(channels, channel_id)
+
+      # Permission check engine
+      # Chạy trong worker process — không block guild
+      eligible_user_ids = check_everyone_permissions(
+        table,
+        channel,
+        roles
+      )
+
+      # Gửi notifications
+      deliver_everyone_notifications(
+        guild_id,
+        eligible_user_ids,
+        message
+      )
+    end)
+  end
+end
+```
+
+---
+
+## Worker — parallel permission checking
+
+```elixir
+defmodule Discord.Guild.EveryoneWorker do
+  @moduledoc """
+  Worker process: đọc ETS, check permissions, deliver notifications.
+  Chạy song song với guild process.
+  """
+
+  @chunk_size 10_000     # process 10k members per sub-batch
+  @parallel_workers 8    # số workers parallel
+
+  def check_everyone_permissions(ets_table, channel, roles) do
+    # Strategy: chia ETS table thành chunks
+    # Xử lý parallel với multiple Task processes
+    # Collect results và merge
+
+    total_members = :ets.info(ets_table, :size)
+
+    # Lấy tất cả keys (chỉ user_ids, không copy values)
+    all_keys = :ets.select(ets_table, [
+      {{:"$1", :_}, [], [:"$1"]}
+    ])
+    # all_keys = [user_id_1, user_id_2, ... user_id_1000000]
+    # Chỉ integers — nhỏ, OK to copy
+
+    # Chia thành chunks và process parallel
+    all_keys
+    |> Enum.chunk_every(div(total_members, @parallel_workers))
+    |> Enum.map(fn chunk ->
+      Task.async(fn ->
+        process_member_chunk(chunk, ets_table, channel, roles)
+      end)
+    end)
+    |> Task.await_many(30_000)  # timeout 30 giây
+    |> List.flatten()
+  end
+
+  defp process_member_chunk(user_ids, table, channel, roles) do
+    # Xử lý một chunk members
+    Enum.reduce(user_ids, [], fn user_id, eligible ->
+      # Đọc member data từ ETS — single entry, nhỏ
+      case :ets.lookup(table, user_id) do
+        [{^user_id, member}] ->
+          if everyone_eligible?(member, channel, roles) do
+            [user_id | eligible]
+          else
+            eligible
+          end
+        [] ->
+          eligible  # member đã leave
+      end
+    end)
+  end
+
+  defp everyone_eligible?(member, channel, roles) do
+    # Tính permissions — đã explain ở trên
+    base   = compute_base_permissions(member.roles, roles)
+    actual = apply_channel_overwrites(base, member.roles,
+                                       channel.permission_overwrites)
+
+    has_permission?(actual, :view_channel) and
+    not member_suppressed_everyone?(member)
+    # Note: user notification preferences check separately
+    # (không stored trong guild ETS — stored per-user trong separate store)
+  end
+end
+```
+
+---
+
+## Deliver notifications — không phải simple fanout
+
+```elixir
+defmodule Discord.Guild.EveryoneDelivery do
+  def deliver_everyone_notifications(guild_id, eligible_user_ids, message) do
+    # @everyone delivery khác với normal message delivery:
+    # 1. Active sessions: gửi full message (như bình thường)
+    # 2. Passive sessions: gửi PUSH notification (không chỉ badge)
+    # 3. Offline users: queue push notification (mobile push)
+
+    # Phân loại eligible users
+    {active, passive, offline} = classify_users(
+      guild_id,
+      eligible_user_ids
+    )
+
+    # Gửi tới active sessions — qua relay (nhanh)
+    deliver_to_active(guild_id, active, message)
+
+    # Gửi push notification tới passive (có WebSocket nhưng không active)
+    deliver_push_to_passive(passive, message)
+
+    # Queue mobile push cho offline users
+    # (qua APNs, FCM — không qua Elixir)
+    queue_mobile_push(offline, message)
+  end
+
+  defp classify_users(guild_id, user_ids) do
+    # Lookup session registry
+    Enum.reduce(user_ids, {[], [], []}, fn user_id, {active, passive, offline} ->
+      case Discord.Session.Registry.lookup(user_id) do
+        {:ok, session_pid, :active}  -> {[session_pid | active], passive, offline}
+        {:ok, session_pid, :passive} -> {active, [session_pid | passive], offline}
+        {:error, :not_found}         -> {active, passive, [user_id | offline]}
+      end
+    end)
+  end
+
+  defp deliver_to_active(guild_id, active_pids, message) do
+    # Dùng Manifold — group by node, batch
+    Manifold.send(active_pids, {:everyone_mention, message})
+  end
+
+  defp deliver_push_to_passive(passive_pids, message) do
+    # Passive sessions nhận stripped notification
+    # Đủ để hiện badge + notification popup
+    notification = %{
+      type:       :everyone_mention,
+      preview:    String.slice(message.content, 0, 100),
+      channel_id: message.channel_id,
+      guild_id:   message.guild_id,
+      timestamp:  message.timestamp,
+    }
+    Manifold.send(passive_pids, {:push_notification, notification})
+  end
+
+  defp queue_mobile_push(offline_user_ids, message) do
+    # Batch push notifications
+    # Gửi qua separate push notification service
+    # Không block main flow
+    Discord.PushNotification.queue_batch(
+      offline_user_ids,
+      %{
+        title:   "@everyone mentioned you",
+        body:    String.slice(message.content, 0, 200),
+        guild_id: message.guild_id,
+      }
+    )
+  end
+end
+```
+
+---
+
+## Timing analysis — bao lâu thực sự?
+
+```elixir
+defmodule Discord.EveryoneTiming do
+  @doc """
+  Breakdown timing của @everyone cho 1,000,000 member guild
+  """
+
+  def timing_breakdown do
+    # Step 1: Guild dispatch tới worker
+    # Thời gian: ~1μs (spawn task + send message)
+    # Guild blocked: 0ms ← key!
+
+    # Step 2: Worker đọc tất cả keys từ ETS
+    # :ets.select 1,000,000 keys (chỉ integers)
+    # Thời gian: ~500ms (copy 1M integers)
+    # Guild blocked: 0ms (worker process riêng)
+
+    # Step 3: Chia thành 8 chunks, parallel processing
+    # Mỗi chunk: 125,000 members
+    # Per member: 1 ETS lookup + permission computation
+    # ETS lookup: ~0.5μs
+    # Permission compute: ~2μs (bitwise ops)
+    # Per member total: ~2.5μs
+    # Per chunk: 125,000 × 2.5μs = ~312ms
+    # 8 parallel workers: ~312ms (parallel!)
+    # Guild blocked: 0ms
+
+    # Step 4: Merge results từ 8 workers
+    # Flatten 8 lists: ~10ms
+    # Guild blocked: 0ms
+
+    # Step 5: Classify users (active/passive/offline)
+    # Session Registry lookup per user
+    # ETS lookup: ~0.5μs per user
+    # 1,000,000 × 0.5μs = ~500ms (nếu sequential)
+    # → Thực tế: chunk + parallel → ~100ms
+    # Guild blocked: 0ms
+
+    # Step 6: Deliver tới active sessions
+    # Manifold.send → group by node → batch TCP
+    # ~10ms
+    # Guild blocked: 0ms
+
+    # Step 7: Queue push notifications (async)
+    # ~5ms
+    # Guild blocked: 0ms
+
+    # TOTAL worker time: ~1,400ms (1.4 giây)
+    # GUILD BLOCKED: 0ms ← đây là điều quan trọng
+
+    # Users experience:
+    # Active users: nhận message trong ~10ms (fanout)
+    # Passive users: nhận push trong ~1.5 giây
+    # Offline users: nhận mobile push trong ~2-5 giây
+    :ok
+  end
+end
+```
+
+---
+
+## Permission cache optimization
+
+```elixir
+defmodule Discord.Permission.Cache do
+  @moduledoc """
+  @everyone check 1,000,000 members tốn 1.4 giây.
+  Với cache thông minh có thể giảm xuống ~200ms.
+  """
+
+  # Cache level 1: Pre-computed permission bits trong ETS
+  # Thay vì compute mỗi lần → store kết quả
+
+  def precompute_channel_permissions(guild_id, channel_id) do
+    table     = :"guild_members_#{guild_id}"
+    channel   = Discord.Guild.get_channel(guild_id, channel_id)
+    roles     = Discord.Guild.get_roles(guild_id)
+
+    # Batch precompute và store trong ETS
+    :ets.foldl(fn {user_id, member}, _acc ->
+      perms = compute_effective_permissions(member, channel, roles)
+
+      # Store computed permissions back vào ETS
+      # (separate ETS table để tránh bloat member table)
+      :ets.insert(:"guild_permissions_#{guild_id}",
+        {{user_id, channel_id}, perms})
+
+      nil
+    end, nil, table)
+  end
+
+  # Khi role hoặc channel thay đổi → invalidate cache
+  def invalidate_channel_permissions(guild_id, channel_id) do
+    :ets.match_delete(
+      :"guild_permissions_#{guild_id}",
+      {{:_, channel_id}, :_}
+    )
+    # Lazily recompute khi cần
+  end
+
+  # @everyone check với cache
+  def check_with_cache(user_id, channel_id, guild_id) do
+    cache_table = :"guild_permissions_#{guild_id}"
+
+    case :ets.lookup(cache_table, {user_id, channel_id}) do
+      [{{^user_id, ^channel_id}, perms}] ->
+        # Cache hit: ~0.5μs
+        has_permission?(perms, :view_channel)
+
+      [] ->
+        # Cache miss: compute và store
+        perms = compute_and_cache(user_id, channel_id, guild_id)
+        has_permission?(perms, :view_channel)
+    end
+  end
+
+  # Với pre-computed cache:
+  # Per member check: ~0.5μs (ETS lookup only)
+  # 1,000,000 × 0.5μs = 500ms sequential
+  # 8 parallel workers: ~62ms
+  # Total @everyone: ~200ms instead of 1.4 giây
+end
+```
+
+---
+
+## Rate limiting @everyone
+
+```elixir
+defmodule Discord.Guild.EveryoneRateLimit do
+  @moduledoc """
+  @everyone là expensive operation.
+  Rate limit để tránh abuse và resource exhaustion.
+  """
+
+  # Không cho phép @everyone quá thường xuyên
+  @cooldown_seconds 3600  # 1 giờ per channel
+
+  def check_and_execute_everyone_ping(guild_id, channel_id,
+                                       user_id, message, state) do
+    rate_limit_key = "everyone:#{guild_id}:#{channel_id}"
+
+    case check_rate_limit(rate_limit_key) do
+      :ok ->
+        # Proceed với @everyone
+        spawn_everyone_worker(state, channel_id, message)
+        {:ok, state}
+
+      {:error, :rate_limited, reset_at} ->
+        # Gửi error message về cho user
+        # Không execute @everyone
+        notify_rate_limited(user_id, channel_id, reset_at)
+        {:error, :rate_limited}
+    end
+  end
+
+  defp check_rate_limit(key) do
+    # Dùng ETS-based rate limiter (không cần Redis cho này)
+    now = System.system_time(:second)
+
+    case :ets.lookup(:everyone_rate_limits, key) do
+      [{^key, last_used}] when now - last_used < @cooldown_seconds ->
+        reset_at = last_used + @cooldown_seconds
+        {:error, :rate_limited, reset_at}
+
+      _ ->
+        :ets.insert(:everyone_rate_limits, {key, now})
+        :ok
+    end
+  end
+
+  # Special case: @here (chỉ ping online members)
+  # Cheaper vì chỉ check online sessions, không phải tất cả members
+  def handle_here_ping(guild_id, channel_id, message, state) do
+    # @here: chỉ active + passive sessions (đã connected)
+    # Không cần scan 1M members trong ETS
+    connected_users = get_connected_users(state)
+
+    eligible = Enum.filter(connected_users, fn {user_id, _} ->
+      can_see_channel_cached?(user_id, channel_id, guild_id)
+    end)
+
+    # Rẻ hơn nhiều: chỉ O(connected) thay vì O(all_members)
+    deliver_everyone_notifications(guild_id, eligible, message)
+  end
+end
+```
+
+---
+
+## Tổng kết — @everyone là microcosm của Discord architecture
+
+```
+@everyone giống Discord architecture ở dạng thu nhỏ:
+
+Challenge          Solution              Pattern
+─────────────────────────────────────────────────────────────
+1M permission      ETS worker            Off-heap + async worker
+checks block guild
+
+Sequential         8 parallel Task       Process parallelism
+takes 1.4s         workers               (không phải threads)
+
+Permission         Pre-computed cache    ETS as computation cache
+recomputed each    in ETS                (update on invalidation)
+time
+
+Deliver to         3-tier delivery       Classify by engagement
+1M users           active/passive/       level → appropriate
+differently        offline               channel
+
+Abuse prevention   ETS rate limiter      Local state, fast check
+
+Guild stays        Task.start            Fire-and-forget async
+responsive         (not linked)          worker, crash isolated
+─────────────────────────────────────────────────────────────
+
+Timeline:
+  Guild blocked:    0ms (immediate Task.start)
+  Active delivery:  ~10ms
+  Full eligibility: ~200ms (với cache), ~1.4s (không cache)
+  Push delivery:    ~1.5s
+  Mobile push:      2-5s
+
+Key lesson:
+  "Làm trong guild process" ≠ "Guild process làm"
+  Guild OWNS operation nhưng DELEGATES execution
+  ETS là shared memory bridge cho delegation
+```
+
+---
+
