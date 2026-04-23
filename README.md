@@ -7588,3 +7588,821 @@ Key lesson:
 
 ---
 
+# Q14 + Q15: Lazy Guild Loading, Thundering Herd, và Unknown Unknowns Cuối
+
+*Kết thúc series với những bài học sâu nhất*
+
+---
+
+## Q14: Lazy Load/Unload Guild Process — Cold Start Problem
+
+### Tại sao không giữ tất cả guild processes trong memory
+
+```
+Discord có 32.2 triệu active servers (guilds).
+Nếu giữ tất cả trong memory:
+
+  32,200,000 guilds × minimum guild state:
+    metadata:     ~1KB
+    ETS overhead: ~100KB (minimum table)
+    process heap: ~50KB
+  = ~5TB RAM chỉ cho guild processes
+
+Discord thực tế có: ~400-500 nodes × ~200GB RAM = ~80-100TB total
+→ Không thể giữ tất cả 32M guilds
+→ Phải lazy load/unload
+```
+
+### Guild lifecycle — 3 trạng thái
+
+```elixir
+defmodule Discord.Guild.Lifecycle do
+  @moduledoc """
+  Guild có 3 trạng thái:
+
+  :unloaded  → không có process trong memory
+               data chỉ trong ScyllaDB + Redis cache
+
+  :loading   → process đang start, load data từ DB
+               requests phải đợi hoặc được queued
+
+  :loaded    → process active, serve traffic
+               có ETS table, relay processes, etc.
+  """
+
+  # Khi user đầu tiên connect tới guild → trigger load
+  def ensure_loaded(guild_id) do
+    case Horde.Registry.lookup(Discord.Guild.HordeRegistry, guild_id) do
+      [{pid, %{status: :loaded}}] ->
+        # Happy path: guild đã loaded
+        {:ok, pid}
+
+      [{pid, %{status: :loading}}] ->
+        # Guild đang load → đợi
+        wait_for_guild_ready(guild_id, pid)
+
+      [] ->
+        # Guild chưa load → start process
+        start_guild_process(guild_id)
+    end
+  end
+
+  defp start_guild_process(guild_id) do
+    case Horde.DynamicSupervisor.start_child(
+      Discord.Guild.HordeSupervisor,
+      {Discord.Guild.Process, guild_id: guild_id}
+    ) do
+      {:ok, pid}                        -> wait_for_guild_ready(guild_id, pid)
+      {:error, {:already_started, pid}} -> wait_for_guild_ready(guild_id, pid)
+      error                             -> error
+    end
+  end
+
+  defp wait_for_guild_ready(guild_id, pid) do
+    # Subscribe tới "guild_ready" PubSub event
+    Phoenix.PubSub.subscribe(Discord.PubSub, "guild_ready:#{guild_id}")
+
+    # Check lại (tránh race: guild ready trước khi subscribe)
+    case Horde.Registry.lookup(Discord.Guild.HordeRegistry, guild_id) do
+      [{^pid, %{status: :loaded}}] ->
+        Phoenix.PubSub.unsubscribe(Discord.PubSub, "guild_ready:#{guild_id}")
+        {:ok, pid}
+
+      _ ->
+        # Chờ event
+        receive do
+          {:guild_ready, ^guild_id, ready_pid} ->
+            {:ok, ready_pid}
+        after
+          30_000 -> {:error, :guild_load_timeout}
+        end
+    end
+  end
+end
+```
+
+### Guild unload — khi nào và như thế nào
+
+```elixir
+defmodule Discord.Guild.UnloadPolicy do
+  @moduledoc """
+  Guild được unload khi:
+  1. Không còn connected sessions (tất cả users offline)
+  2. Sau grace period (đợi users reconnect sau brief disconnect)
+
+  Không unload khi:
+  - Có pending writes chưa flush
+  - Đang được migrate
+  - Guild là "hot" (thường xuyên có traffic)
+  """
+
+  @grace_period_ms 300_000    # 5 phút grace period
+  @hot_guild_threshold 100    # guilds với >100 active users/ngày = hot
+
+  def handle_cast(:check_unload_eligibility, state) do
+    cond do
+      # Còn sessions connected → không unload
+      map_size(state.active_sessions) > 0 or
+      map_size(state.passive_sessions) > 0 ->
+        {:noreply, state}
+
+      # Guild là "hot" → keep warm
+      hot_guild?(state.guild_id) ->
+        schedule_unload_check(state)
+        {:noreply, state}
+
+      # Có pending writes → flush trước
+      state.pending_member_updates != [] ->
+        flush_pending_updates(state)
+        schedule_unload_check(state)
+        {:noreply, state}
+
+      # OK để unload
+      true ->
+        initiate_graceful_unload(state)
+    end
+  end
+
+  defp hot_guild?(guild_id) do
+    # Check Redis: số sessions trong 24h qua
+    case Redis.get("guild_activity:#{guild_id}") do
+      {:ok, count} when count > @hot_guild_threshold -> true
+      _ -> false
+    end
+  end
+
+  defp initiate_graceful_unload(state) do
+    # 1. Flush tất cả pending data vào DB
+    flush_all_state(state)
+
+    # 2. Persist hot data vào Redis (fast reload)
+    cache_for_fast_reload(state)
+
+    # 3. Cleanup ETS table
+    :ets.delete(state.ets_table)
+
+    # 4. Deregister từ Horde
+    Horde.Registry.unregister(
+      Discord.Guild.HordeRegistry,
+      state.guild_id
+    )
+
+    # 5. Stop process
+    {:stop, :normal, state}
+  end
+
+  defp cache_for_fast_reload(state) do
+    # Cache guild metadata trong Redis
+    # Khi guild reload → đọc từ Redis thay vì DB
+    # Redis read: ~1ms vs DB read: ~50ms
+    Redis.setex(
+      "guild_cache:#{state.guild_id}",
+      3600,  # 1 giờ TTL
+      serialize_hot_state(state)
+    )
+  end
+end
+```
+
+---
+
+## Q15: Thundering Herd — Khi 32 Triệu Guilds Cùng Cold Start
+
+### Scenario: Discord deploy code mới
+
+```
+Rolling deploy: restart từng node một
+Mỗi node restart:
+  → Tất cả guilds trên node đó bị unload
+  → Users reconnect → trigger guild reload
+  → Nếu 10,000 guilds reload cùng lúc trên 1 node:
+    → 10,000 DB queries đồng thời
+    → DB bị overload
+    → Query timeout
+    → Guild load fails
+    → Users không vào được guild
+    → Cascade failure
+```
+
+### Pattern 1: Request coalescing
+
+```elixir
+defmodule Discord.Guild.LoadCoalescer do
+  @moduledoc """
+  Nhiều sessions muốn load cùng 1 guild cùng lúc
+  → Chỉ trigger 1 load request, không phải N
+
+  Pattern: "single-flight" hay "request coalescing"
+  """
+
+  use GenServer
+
+  # Map: guild_id → list of callers waiting
+  # {:loading, [caller1, caller2, ...]}
+  # {:loaded, pid}
+  defstruct pending: %{}
+
+  def ensure_loaded(guild_id) do
+    GenServer.call(__MODULE__, {:ensure_loaded, guild_id}, 60_000)
+  end
+
+  def handle_call({:ensure_loaded, guild_id}, from, state) do
+    case Map.get(state.pending, guild_id) do
+      nil ->
+        # First request for this guild → start load
+        spawn_guild_loader(guild_id, self())
+        new_pending = Map.put(state.pending, guild_id,
+                              {:loading, [from]})
+        # Không reply ngay — caller sẽ chờ
+        {:noreply, %{state | pending: new_pending}}
+
+      {:loading, waiters} ->
+        # Guild đang load → thêm vào waiting list
+        # Không trigger load mới
+        new_pending = Map.put(state.pending, guild_id,
+                              {:loading, [from | waiters]})
+        {:noreply, %{state | pending: new_pending}}
+
+      {:loaded, pid} ->
+        # Guild đã loaded → reply ngay
+        {:reply, {:ok, pid}, state}
+    end
+  end
+
+  def handle_info({:guild_loaded, guild_id, pid}, state) do
+    case Map.get(state.pending, guild_id) do
+      {:loading, waiters} ->
+        # Reply cho tất cả waiters cùng lúc
+        Enum.each(waiters, fn from ->
+          GenServer.reply(from, {:ok, pid})
+        end)
+        # Update state
+        new_pending = Map.put(state.pending, guild_id, {:loaded, pid})
+        {:noreply, %{state | pending: new_pending}}
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  defp spawn_guild_loader(guild_id, coalescer_pid) do
+    Task.start(fn ->
+      {:ok, pid} = Discord.Guild.DynamicSupervisor.ensure_started(guild_id)
+      send(coalescer_pid, {:guild_loaded, guild_id, pid})
+    end)
+  end
+end
+```
+
+### Pattern 2: Staggered loading với token bucket
+
+```elixir
+defmodule Discord.Guild.LoadThrottler do
+  @moduledoc """
+  Giới hạn số guild loads đồng thời
+  để không overload DB.
+
+  Token bucket algorithm:
+  - Bucket size: 100 tokens (100 concurrent loads)
+  - Refill rate: 50 tokens/giây
+  - Mỗi guild load: 1 token
+  """
+
+  use GenServer
+
+  @bucket_size    100   # max concurrent guild loads
+  @refill_rate    50    # tokens per second
+  @refill_interval 20   # ms between refills (50/s = 1 per 20ms)
+
+  defstruct [
+    tokens:       100,
+    waiting_queue: :queue.new(),
+  ]
+
+  def request_load_slot do
+    GenServer.call(__MODULE__, :request_slot, 60_000)
+  end
+
+  def release_slot do
+    GenServer.cast(__MODULE__, :release_slot)
+  end
+
+  def handle_call(:request_slot, from, state) do
+    if state.tokens > 0 do
+      # Token available → grant immediately
+      {:reply, :ok, %{state | tokens: state.tokens - 1}}
+    else
+      # No tokens → queue request
+      new_queue = :queue.in(from, state.waiting_queue)
+      {:noreply, %{state | waiting_queue: new_queue}}
+    end
+  end
+
+  def handle_cast(:release_slot, state) do
+    # Token returned → grant to next waiter if any
+    case :queue.out(state.waiting_queue) do
+      {{:value, from}, new_queue} ->
+        GenServer.reply(from, :ok)
+        {:noreply, %{state | waiting_queue: new_queue}}
+
+      {:empty, _} ->
+        new_tokens = min(state.tokens + 1, @bucket_size)
+        {:noreply, %{state | tokens: new_tokens}}
+    end
+  end
+
+  def handle_info(:refill, state) do
+    # Refill tokens periodically
+    new_tokens = min(state.tokens + 1, @bucket_size)
+
+    # Drain waiting queue with new tokens
+    {new_state, remaining_tokens} = drain_queue(
+      %{state | tokens: new_tokens}
+    )
+
+    Process.send_after(self(), :refill, @refill_interval)
+    {:noreply, %{new_state | tokens: remaining_tokens}}
+  end
+
+  defp drain_queue(%{tokens: 0} = state), do: {state, 0}
+  defp drain_queue(state) do
+    case :queue.out(state.waiting_queue) do
+      {{:value, from}, new_queue} ->
+        GenServer.reply(from, :ok)
+        drain_queue(%{state |
+          tokens: state.tokens - 1,
+          waiting_queue: new_queue
+        })
+      {:empty, _} ->
+        {state, state.tokens}
+    end
+  end
+end
+
+# Usage trong guild load path:
+defmodule Discord.Guild.Process do
+  def init(guild_id) do
+    # Acquire load slot trước khi hit DB
+    :ok = Discord.Guild.LoadThrottler.request_load_slot()
+
+    try do
+      state = load_guild_state(guild_id)
+      {:ok, state}
+    after
+      # Release slot dù thành công hay thất bại
+      Discord.Guild.LoadThrottler.release_slot()
+    end
+  end
+end
+```
+
+### Pattern 3: Tiered loading — fast path từ cache
+
+```elixir
+defmodule Discord.Guild.TieredLoader do
+  @moduledoc """
+  3-tier loading strategy:
+  Tier 1: Redis cache (1-5ms)  → hot guild data
+  Tier 2: ETS snapshot (10ms)  → recent snapshot
+  Tier 3: ScyllaDB (50-500ms) → cold data
+
+  Giảm average load time từ 500ms xuống ~5ms
+  cho guilds vừa mới unload.
+  """
+
+  def load_guild_state(guild_id) do
+    case load_from_redis(guild_id) do
+      {:ok, state} ->
+        # Tier 1 hit: guild vừa unload gần đây
+        # Redis cache còn TTL
+        {:ok, state, :hot}
+
+      :miss ->
+        case load_from_ets_snapshot(guild_id) do
+          {:ok, state} ->
+            # Tier 2 hit: snapshot file từ periodic flush
+            {:ok, state, :warm}
+
+          :miss ->
+            # Tier 3: full DB load
+            state = load_from_db(guild_id)
+            {:ok, state, :cold}
+        end
+    end
+  end
+
+  defp load_from_redis(guild_id) do
+    case Redis.get("guild_cache:#{guild_id}") do
+      {:ok, nil}   -> :miss
+      {:ok, data}  -> {:ok, deserialize(data)}
+      {:error, _}  -> :miss
+    end
+  end
+
+  defp load_from_ets_snapshot(guild_id) do
+    snapshot_path = "/tmp/guild_snapshots/#{guild_id}.ets"
+    case File.exists?(snapshot_path) do
+      false -> :miss
+      true  ->
+        # Load ETS snapshot từ disk
+        case :ets.file2tab(String.to_charlist(snapshot_path)) do
+          {:ok, table} -> {:ok, %{ets_table: table}}
+          _            -> :miss
+        end
+    end
+  end
+
+  defp load_from_db(guild_id) do
+    # Full DB load — slow nhưng authoritative
+    metadata = Discord.Repo.get!(Discord.Guild, guild_id)
+    table    = create_ets_table(guild_id)
+
+    # Stream members từ ScyllaDB
+    Discord.DB.stream_guild_members(guild_id)
+    |> Stream.chunk_every(1_000)
+    |> Enum.each(fn chunk ->
+      :ets.insert(table, chunk)
+    end)
+
+    %{
+      guild_id: guild_id,
+      ets_table: table,
+      metadata:  metadata,
+    }
+  end
+
+  # Periodic snapshot — giảm cold start time
+  def periodic_snapshot(guild_id, ets_table) do
+    path = "/tmp/guild_snapshots/#{guild_id}.ets"
+    :ets.tab2file(ets_table, String.to_charlist(path))
+    # Chạy mỗi 5 phút cho active guilds
+    # → Nếu guild unload và reload trong 5 phút → warm start
+  end
+end
+```
+
+---
+
+## Unknown Unknowns cuối — những gì không ai nói với bạn
+
+### UU #1: Atom table là global resource có limit
+
+```elixir
+defmodule Discord.AtomTableDanger do
+  # Atom table: tối đa 1,048,576 atoms (mặc định)
+  # Atoms KHÔNG BAO GIỜ bị GC
+  # → Atom leak = VM crash
+
+  # NGUY HIỂM: tạo atom từ user input
+  def dangerous(user_input) do
+    String.to_atom(user_input)  # ❌ atom leak!
+    # Mỗi unique user_input = 1 atom mới
+    # 1 triệu users = 1 triệu atoms = crash!
+  end
+
+  # AN TOÀN:
+  def safe(user_input) do
+    # Chỉ convert nếu atom đã tồn tại
+    String.to_existing_atom(user_input)  # ✅
+    # Raise nếu atom chưa tồn tại → safe
+  end
+
+  # Discord's rule: KHÔNG BAO GIỜ to_atom từ user data
+  # Guild ID, User ID → luôn giữ là integer hoặc binary
+  # Module names → dùng Module.concat với known atoms
+end
+```
+
+### UU #2: Binary heap fragmentation
+
+```elixir
+defmodule Discord.BinaryFragmentation do
+  @moduledoc """
+  Refc binaries (> 64 bytes) có reference counting.
+  Fragmentation xảy ra khi nhiều sub-binaries giữ
+  reference tới binary gốc lớn.
+  """
+
+  def fragmentation_example do
+    # Nhận large binary từ network (e.g., image upload 10MB)
+    large_binary = receive_from_network()  # 10MB
+
+    # Extract small pieces
+    header    = binary_part(large_binary, 0, 100)      # sub-binary
+    user_id   = binary_part(large_binary, 100, 8)      # sub-binary
+    thumbnail = binary_part(large_binary, 108, 1024)   # sub-binary
+
+    # large_binary (10MB) KHÔNG được GC
+    # Vì header, user_id, thumbnail đang giữ reference
+    # Dù chỉ cần 1132 bytes, giữ 10MB trong memory!
+
+    # Fix: copy sub-binaries để release large binary
+    header_copy    = :binary.copy(header)
+    user_id_copy   = :binary.copy(user_id)
+    thumbnail_copy = :binary.copy(thumbnail)
+    # Bây giờ large_binary có thể GC được
+    {header_copy, user_id_copy, thumbnail_copy}
+  end
+
+  # Discord rule: sau khi parse binary từ network,
+  # copy tất cả sub-binaries trước khi store
+  # → Tránh fragmentation leak
+end
+```
+
+### UU #3: GenServer.call timeout cascade
+
+```elixir
+defmodule Discord.TimeoutCascade do
+  @moduledoc """
+  GenServer.call timeout mặc định là 5 giây.
+  Nếu A calls B calls C calls D:
+  - D timeout sau 5s → C nhận timeout → B nhận timeout → A nhận timeout
+  Mỗi tầng: 5 giây × 4 tầng = 20 giây total wait
+  Trong 20 giây: process mailboxes backup → memory pressure
+  """
+
+  # ANTI-PATTERN: deep call chains với default timeout
+  def dangerous_chain(guild_id) do
+    # Session → Guild → DB → Cache (4 levels)
+    # Timeout: 5s × 4 = 20s cascade potential
+    GenServer.call(guild_pid, {:complex_query, guild_id})
+  end
+
+  # BETTER: explicit timeout + fail fast
+  def safe_chain(guild_id) do
+    # Total budget: 2 giây
+    # Distribute across chain
+    timeout = 2_000
+    GenServer.call(guild_pid, {:complex_query, guild_id}, timeout)
+  end
+
+  # BEST: async + timeout
+  def best_approach(guild_id) do
+    task = Task.async(fn ->
+      GenServer.call(guild_pid, {:complex_query, guild_id}, 1_500)
+    end)
+
+    case Task.yield(task, 2_000) do
+      {:ok, result} -> result
+      nil ->
+        Task.shutdown(task, :brutal_kill)
+        {:error, :timeout}
+    end
+  end
+
+  # Discord rule: mọi external call phải có explicit timeout
+  # Timeout budget: total_SLA / call_depth
+  # SLA = 1000ms, depth = 4 → 250ms per call
+end
+```
+
+### UU #4: Hot code loading trong production
+
+```elixir
+defmodule Discord.HotCodeLoading do
+  @moduledoc """
+  Erlang hỗ trợ hot code loading — update code
+  mà không restart process.
+  Discord KHÔNG dùng hot code loading cho business logic.
+  Chỉ dùng cho emergency patches.
+  """
+
+  # Tại sao không dùng hot code loading thường xuyên:
+
+  # 1. Race condition: process đang chạy old code
+  #    nhận message cho new code format
+  #    → Pattern match fail → crash
+
+  # 2. State migration: old state structure ≠ new state structure
+  #    Phải viết code_change/3 cho mọi GenServer
+  #    Dễ bị miss → silent corruption
+
+  # 3. Only 2 versions coexist:
+  #    BEAM chỉ giữ old + new version cùng lúc
+  #    Deploy version 3 → version 1 bị kill ngay
+  #    Nếu process vẫn chạy version 1 → crash
+
+  # Discord approach: rolling deploy với process restart
+  # Predictable, testable, không có hot code gotchas
+
+  # Emergency use case:
+  def emergency_patch(module, new_code_binary) do
+    :code.load_binary(module, ~c"emergency", new_code_binary)
+    # Chỉ dùng khi production đang cháy và không thể deploy
+  end
+end
+```
+
+### UU #5: Scheduler collapse dưới sustained load
+
+```elixir
+defmodule Discord.SchedulerCollapse do
+  @moduledoc """
+  Sustained high load → scheduler collapse pattern:
+  1. Load tăng → scheduler busy hơn
+  2. Processes chờ lâu hơn → mailboxes grow
+  3. GC pressure tăng (large mailboxes)
+  4. GC pause → scheduler bị block
+  5. Scheduler block → processes chờ còn lâu hơn
+  6. Positive feedback loop → system không recover được
+
+  Discord gọi đây là "death spiral"
+  """
+
+  # Detection: giám sát scheduler utilization trend
+  def detect_death_spiral do
+    measurements = Enum.map(1..10, fn _ ->
+      util = measure_scheduler_utilization()
+      Process.sleep(1_000)
+      util
+    end)
+
+    # Nếu utilization tăng đều đặn trong 10 giây
+    # mà không có corresponding load increase → death spiral
+    trend = calculate_trend(measurements)
+
+    if trend > 0.05 do  # tăng > 5%/giây
+      :telemetry.execute(
+        [:discord, :scheduler, :death_spiral_detected],
+        %{trend: trend},
+        %{}
+      )
+      trigger_load_shedding()
+    end
+  end
+
+  # Load shedding: reject non-critical requests
+  defp trigger_load_shedding do
+    # Tạm thời từ chối:
+    # - Bot API requests (lower priority)
+    # - Bulk operations
+    # - Non-essential background jobs
+    # Giữ lại: user messages, session management
+    Discord.LoadShedder.enable(:aggressive)
+    Process.send_after(self(), :disable_load_shedding, 30_000)
+  end
+end
+```
+
+### UU #6: ETS table ownership và process crash
+
+```elixir
+defmodule Discord.ETSOwnership do
+  @moduledoc """
+  ETS table bị DESTROYED khi owner process chết.
+  Đây là unexpected behavior mà nhiều người không biết.
+  """
+
+  # DANGEROUS: guild process owns ETS
+  # Guild crash → ETS destroyed → tất cả relays mất member data
+  def dangerous_setup(guild_id) do
+    table = :ets.new(:"guild_#{guild_id}", [:set, :public])
+    # Table owner = guild process
+    # Guild crash → table gone
+    table
+  end
+
+  # SAFE: dùng heir để transfer ownership khi crash
+  def safe_setup(guild_id, supervisor_pid) do
+    table = :ets.new(:"guild_#{guild_id}", [
+      :set,
+      :public,
+      # Nếu owner (guild) chết:
+      # ETS transfer ownership cho supervisor_pid
+      # supervisor_pid nhận: {:ETS-TRANSFER, table, from_pid, data}
+      {:heir, supervisor_pid, guild_id}
+    ])
+
+    # Supervisor giữ table alive
+    # Khi guild restart → supervisor transfer lại
+    table
+  end
+
+  # Supervisor handle ETS transfer
+  def handle_info({:"ETS-TRANSFER", table, _from, guild_id}, state) do
+    # Guild crashed, ETS transferred to supervisor
+    # Store table reference
+    new_state = Map.put(state, {:ets_table, guild_id}, table)
+
+    # Khi guild restart, give back the table
+    # Guild process call supervisor để nhận lại table
+    {:noreply, new_state}
+  end
+
+  def handle_call({:reclaim_ets_table, guild_id}, {guild_pid, _}, state) do
+    case Map.get(state, {:ets_table, guild_id}) do
+      nil -> {:reply, {:error, :not_found}, state}
+      table ->
+        # Transfer ownership lại cho guild process
+        :ets.give_away(table, guild_pid, :reclaimed)
+        new_state = Map.delete(state, {:ets_table, guild_id})
+        {:reply, {:ok, table}, new_state}
+    end
+  end
+end
+```
+
+### UU #7: Distribution buffer overflow
+
+```elixir
+defmodule Discord.DistributionBuffer do
+  @moduledoc """
+  Erlang distribution có buffer giữa nodes.
+  Mặc định: 1MB (quá nhỏ cho Discord's fanout).
+
+  Khi buffer đầy:
+  → Sending process bị SUSPENDED
+  → Không phải error, không có exception
+  → Process block indefinitely cho đến khi buffer drain
+
+  Đây là hidden backpressure mà nhiều người không biết.
+  """
+
+  # Symptom: guild process "hang" không rõ lý do
+  # Root cause: distribution buffer full đến remote node
+
+  # Fix trong vm.args:
+  # +zdbbl 32768    ← 32MB distribution buffer
+  # Default: 1024   ← 1MB
+
+  # Monitor distribution buffer:
+  def check_distribution_health do
+    Node.list()
+    |> Enum.each(fn node ->
+      case :erlang.dist_ctrl_get_data_notification(node) do
+        :ok -> :ok
+        {:error, reason} ->
+          :telemetry.execute(
+            [:discord, :distribution, :buffer_pressure],
+            %{},
+            %{node: node, reason: reason}
+          )
+      end
+    end)
+  end
+
+  # Pattern: detect khi guild process bị stuck
+  # vì distribution buffer
+  def detect_stuck_guild(guild_pid) do
+    case Process.info(guild_pid, :current_function) do
+      {:current_function, {:erlang, :dist_ctrl_put_data, 2}} ->
+        # Process bị stuck writing to distribution
+        :telemetry.execute(
+          [:discord, :guild, :distribution_blocked],
+          %{},
+          %{pid: guild_pid}
+        )
+      _ -> :ok
+    end
+  end
+end
+```
+
+---
+
+## Tổng kết toàn bộ series — Unknown Unknowns map
+
+```
+15 câu hỏi đã cover — từ surface đến deep:
+
+Level 1 (Application):
+  Q1:  1 guild = 1 process → khi nào vỡ
+  Q2:  Manifold → O(n) fanout solution
+  Q3:  Passive sessions → 90% reduction
+  Q4:  Relay layer → guild sharding
+
+Level 2 (Platform):
+  Q5:  Copy-on-send + ETS off-heap
+  Q6:  FastGlobal → VM literal pool exploit
+  Q7:  Guild migration → zero-downtime
+  Q8:  ZenMonitor → monitor storm prevention
+  Q9:  Node failure recovery → 40s breakdown
+
+Level 3 (Distributed Systems):
+  Q10: Mnesia failure → ETS + gossip
+  Q11: Distributed tracing → dynamic sampling
+  Q12: BEAM scheduler → reduction mechanics
+  Q13: @everyone → ETS worker pattern
+  Q14: Lazy loading → cold start optimization
+  Q15: Thundering herd + unknown unknowns
+
+Unknown Unknowns discovered:
+  - send/2 cost = scheduling overhead, không phải copy cost
+  - ETS ownership = destroyed on owner crash
+  - Atom table = global unGCable resource
+  - Binary fragmentation = sub-binary reference leak
+  - Distribution buffer = hidden backpressure
+  - Scheduler collapse = positive feedback death spiral
+  - GenServer.call timeout cascade
+  - Hot code loading race conditions
+
+Discord's meta-lesson:
+  "BEAM/OTP cung cấp đúng primitives.
+   Hiểu cơ chế thực sự của từng primitive.
+   Compose chúng đúng cách.
+   Đừng fight the VM — work with it."
+
+Kết quả: 5 engineers vận hành infrastructure
+cho 200 triệu MAU với p99 < 100ms.
+```
