@@ -1,0 +1,94 @@
+<svg width="100%" viewBox="0 0 680 520" role="img" xmlns="http://www.w3.org/2000/svg">
+<title>BEAM Scheduler Architecture</title>
+<style>
+  text { font-family: sans-serif; }
+  .th { font-size: 14px; font-weight: 500; fill: #3d3d3a; }
+  .ts { font-size: 12px; fill: #73726c; }
+  .warn { font-size: 12px; fill: #BA7517; }
+  .ok { font-size: 12px; fill: #1D9E75; }
+  .err { font-size: 12px; fill: #E24B4A; }
+</style>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="#888" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+  <marker id="arrow-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="#E24B4A" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+  <marker id="arrow-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="#1D9E75" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+</defs>
+
+<!-- Title -->
+<text class="th" x="340" y="22" text-anchor="middle">BEAM Scheduler — 1 scheduler per CPU core</text>
+
+<!-- Core 0 scheduler -->
+<rect x="20" y="36" width="300" height="340" rx="10" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<text class="th" x="170" y="56" text-anchor="middle">Scheduler 0 (Core 0)</text>
+
+<!-- Run queue -->
+<rect x="36" y="68" width="268" height="160" rx="8" fill="#B5D4F4" stroke="#185FA5" stroke-width="0.5"/>
+<text class="th" x="170" y="84" text-anchor="middle">Run Queue</text>
+
+<!-- Queue items -->
+<rect x="46" y="94" width="120" height="28" rx="4" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
+<text class="ts" x="106" y="112" text-anchor="middle">Guild_X (running)</text>
+
+<rect x="46" y="128" width="120" height="24" rx="4" fill="#F1EFE8" stroke="#888" stroke-width="0.5"/>
+<text class="ts" x="106" y="144" text-anchor="middle">Session_1 (waiting)</text>
+
+<rect x="46" y="157" width="120" height="24" rx="4" fill="#F1EFE8" stroke="#888" stroke-width="0.5"/>
+<text class="ts" x="106" y="173" text-anchor="middle">Session_2 (waiting)</text>
+
+<rect x="46" y="186" width="120" height="24" rx="4" fill="#F1EFE8" stroke="#888" stroke-width="0.5"/>
+<text class="ts" x="106" y="202" text-anchor="middle">Session_3 (waiting)</text>
+
+<text class="ts" x="106" y="224" text-anchor="middle">... 200 more ...</text>
+
+<!-- Reduction counter -->
+<rect x="36" y="242" width="268" height="52" rx="8" fill="#FCEBEB" stroke="#E24B4A" stroke-width="0.5"/>
+<text class="th" x="170" y="260" text-anchor="middle">Reduction Counter</text>
+<text class="ts" x="170" y="276" text-anchor="middle">Guild_X: 1,847 / 2,000</text>
+<text class="warn" x="170" y="290" text-anchor="middle">153 reductions left → preempt soon</text>
+
+<!-- After preempt -->
+<rect x="36" y="308" width="268" height="52" rx="8" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+<text class="th" x="170" y="326" text-anchor="middle">After 2000 reductions:</text>
+<text class="ts" x="170" y="342" text-anchor="middle">Guild_X → back of queue</text>
+<text class="ok" x="170" y="356" text-anchor="middle">Session_1 gets CPU → runs</text>
+
+<!-- Core 1 scheduler -->
+<rect x="360" y="36" width="300" height="200" rx="10" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text class="th" x="510" y="56" text-anchor="middle">Scheduler 1 (Core 1)</text>
+
+<rect x="376" y="68" width="268" height="100" rx="8" fill="#9FE1CB" stroke="#0F6E56" stroke-width="0.5"/>
+<text class="th" x="510" y="84" text-anchor="middle">Run Queue</text>
+<rect x="386" y="94" width="120" height="24" rx="4" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
+<text class="ts" x="446" y="110" text-anchor="middle">Session_201 (running)</text>
+<rect x="386" y="123" width="120" height="24" rx="4" fill="#F1EFE8" stroke="#888" stroke-width="0.5"/>
+<text class="ts" x="446" y="139" text-anchor="middle">Session_202 (waiting)</text>
+<text class="ts" x="510" y="164" text-anchor="middle">... balanced load ...</text>
+
+<rect x="376" y="182" width="268" height="36" rx="8" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+<text class="ts" x="510" y="200" text-anchor="middle">Work stealing: pulls from overloaded schedulers</text>
+
+<!-- Wait time analysis -->
+<rect x="360" y="258" width="300" height="118" rx="10" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text class="th" x="510" y="278" text-anchor="middle">send/2 Wall Clock Analysis</text>
+<text class="ts" x="376" y="298">Actual send work:  ~1μs</text>
+<text class="ts" x="376" y="314">Queue depth: 200 processes</text>
+<text class="ts" x="376" y="330">Avg timeslice: 0.3ms each</text>
+<text class="ts" x="376" y="346">Wait time: 200 × 0.3ms = 60ms</text>
+<text class="err" x="376" y="362">Wall clock = 1μs + 60ms = ~60μs-70μs</text>
+
+<!-- send/2 flow arrow -->
+<line x1="170" y1="122" x2="170" y2="380" stroke="#E24B4A" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrow-red)"/>
+<text class="ts" x="186" y="390" text-anchor="start">Guild_X calls send/2</text>
+<text class="ts" x="186" y="406" text-anchor="start">→ 1 reduction counted</text>
+<text class="ts" x="186" y="422" text-anchor="start">→ hits 2000 limit</text>
+<text class="ts" x="186" y="438" text-anchor="start">→ preempted</text>
+<text class="ts" x="186" y="454" text-anchor="start">→ waits 30-70ms</text>
+<text class="ts" x="186" y="470" text-anchor="start">→ resumes</text>
+<text class="ok" x="186" y="490" text-anchor="start">→ next send/2</text>
+</svg>
